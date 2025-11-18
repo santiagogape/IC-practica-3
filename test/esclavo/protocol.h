@@ -27,12 +27,12 @@ float remoteSNR = 0;
 /*
     casos:
 
-*   maestro envia por primera vez
-    esclavo responde
+   maestro envia por primera vez
+*   esclavo responde
     --- ciclo ---{
-*       maestro recibe respuesta y ajusta
-*       maestro envia con nueva config
-        esclavo responde
+        maestro recibe respuesta y ajusta
+        maestro envia con nueva config
+*       esclavo responde
     }
 */
 
@@ -42,8 +42,3 @@ void nextConfigFromSlave(const LoRaConfig_t *current,
 
 void decode_from_slave(const uint8_t *package, LoRaConfig_t * node, int *rssi, float *snr);
 uint8_t encode_from_master(LoRaConfig_t * previous_config, int rssi, float snr, uint8_t *package, LoRaConfig_t * next_config);
-uint8_t encode_config_to_package(LoRaConfig_t * initial_config, uint8_t *package);
-}
-
-
-void configureLoRa(LoRaConfig_t * config);

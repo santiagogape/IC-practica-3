@@ -23,6 +23,12 @@
 #include "protocol.h"
 
 // --------------------------------------------------------------------
+// FLAGS
+// --------------------------------------------------------------------
+
+volatile bool FIRST_EXCHANGE = true;       // Flag para indicar cuando ha finalizado una transmisión
+
+// --------------------------------------------------------------------
 // Setup function
 // --------------------------------------------------------------------
 void setup() 
@@ -99,21 +105,16 @@ void loop()
   static uint32_t tx_begin_ms = 0;
       
   if (!transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
+    uint8_t payload[10];
+    LoRaConfig_t currentConfig = thisNodeConf;
+    LoRaConfig_t nextConfig;
+    if (FIRST_EXCHANGE) {
+      uint8_t payloadLength = encode_config_to_package(&currentConfig, payload);
+    } else {
+      uint8_t payloadLength = encode_from_master(&currentConfig, remoteRSSI, remoteSNR, payload, &nextConfig);
+      configureLoRa(&nextConfig);
+    }
 
-    uint8_t payload[50];
-    uint8_t payloadLength = 0;
-
-    payload[payloadLength]    = (thisNodeConf.bandwidth_index << 4);
-    payload[payloadLength++] |= ((thisNodeConf.spreadingFactor - 6) << 1);
-    payload[payloadLength]    = ((thisNodeConf.codingRate - 5) << 6);
-    payload[payloadLength++] |= ((thisNodeConf.txPower - 2) << 1);
-
-    // Incluimos el RSSI y el SNR del último paquete recibido
-    // RSSI puede estar en un rango de [0, -127] dBm
-    payload[payloadLength++] = uint8_t(-LoRa.packetRssi() * 2);
-    // SNR puede estar en un rango de [20, -148] dBm
-    payload[payloadLength++] = uint8_t(148 + LoRa.packetSnr());
-    
     transmitting = true;
     txDoneFlag = false;
     tx_begin_ms = millis();
@@ -123,6 +124,7 @@ void loop()
     Serial.print(msgCount++);
     Serial.print(": ");
     printBinaryPayload(payload, payloadLength);
+    
   }                  
   
   if (transmitting && txDoneFlag) {
@@ -180,6 +182,7 @@ void onReceive(int packetSize)
   
   if (packetSize == 0) return;          // Si no hay mensajes, retornamos
 
+  
   // Leemos los primeros bytes del mensaje
   uint8_t buffer[10];                   // Buffer para almacenar el mensaje
   int recipient = LoRa.read();          // Dirección del destinatario
@@ -224,12 +227,10 @@ void onReceive(int packetSize)
 
   // Actualizamos remoteNodeConf y lo mostramos
   if (receivedBytes == 4) {
-    remoteNodeConf.bandwidth_index = buffer[0] >> 4;
-    remoteNodeConf.spreadingFactor = 6 + ((buffer[0] & 0x0F) >> 1);
-    remoteNodeConf.codingRate = 5 + (buffer[1] >> 6);
-    remoteNodeConf.txPower = 2 + ((buffer[1] & 0x3F) >> 1);
-    remoteRSSI = -int(buffer[2]) / 2.0f;
-    remoteSNR  =  int(buffer[3]) - 148;
+
+    decode_from_slave(buffer, &remoteNodeConf, &remoteRSSI, &remoteSNR);
+    if (FIRST_EXCHANGE) FIRST_EXCHANGE = false;
+  
   
     Serial.print("Remote config: BW: ");
     Serial.print(bandwidth_kHz[remoteNodeConf.bandwidth_index]);
