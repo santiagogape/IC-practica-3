@@ -238,66 +238,120 @@ void printBinaryPayload(uint8_t * payload, uint8_t payloadLength) {
 }
 
 // -------------------- autoAdjustConfig corregido --------------------
+// -------------------- autoAdjustConfig QUE CUMPLE EL ENUNCIADO --------------------
 void autoAdjustConfig() {
-  // inicializar valores
-  bestSNR = -1000.0f;
-  bestConfig.spreadingFactor = thisNodeConf.spreadingFactor;
-  bestConfig.bandwidth_index = thisNodeConf.bandwidth_index;
 
-  for (uint8_t sf = 7; sf <= 12; sf++) {
-    for (uint8_t bw = 7; bw <= 9; bw++) {
+  const float MIN_SNR  = -12.0;   // umbral SNR mínimo aceptable
+  const int   MIN_RSSI = -118;    // umbral RSSI mínimo aceptable
 
-      // reset temporal de remoteSNR para detectar si llega respuesta
-      remoteSNR = -200.0f;
+  Serial.println("\n=== AUTO-ADJUST CONFIG (Optimizar tiempo con SNR/RSSI mínimos) ===");
 
-      // configurar radio en maestro para la prueba
-      LoRa.setSpreadingFactor(sf);
-      LoRa.setSignalBandwidth(long(bandwidth_kHz[bw]));
-      delay(5); // pequeño retardo para que el hardware aplique cambios
+  struct Result {
+    uint8_t sf;
+    uint8_t bw;
+    uint32_t txTime;
+    float snr;
+    int rssi;
+    bool valid;
+  };
 
-      // construir paquete de prueba (msgId 0)
-      uint8_t payload[2] = {sf, bw};
+  Result best = {0, 0, 0xFFFFFFFF, -200.0, -200, false};
 
-      // enviar de forma bloqueante para que la TX termine antes de cambiar parámetros
-      sendMessageBlocking(payload, 2, 0);
+  uint8_t testPayload[2] = {0, 0};
 
-      // asegurar que el radio está en modo recepción
-      LoRa.receive();
+  // PROBAR CONFIGS DE MÁS RÁPIDAS A MÁS LENTAS
+  for (int bw = 9; bw >= 7; bw--) {       // 500 → 250 → 125 kHz
+    for (int sf = 7; sf <= 12; sf++) {    // SF7 → SF12
 
-      // esperar respuesta del esclavo (ajusta según tu latencia)
-      delay(300);
-
-      Serial.print("Test SF=");
+      Serial.print("\nProbando SF=");
       Serial.print(sf);
       Serial.print(" BWidx=");
-      Serial.print(bw);
-      Serial.print(" -> remoteSNR=");
+      Serial.println(bw);
+
+      remoteSNR  = -200.0;
+      remoteRSSI = -200;
+
+      LoRa.setSpreadingFactor(sf);
+      LoRa.setSignalBandwidth((long)bandwidth_kHz[bw]);
+      delay(6);
+
+      testPayload[0] = sf;
+      testPayload[1] = bw;
+
+      uint32_t t0 = millis();
+      sendMessageBlocking(testPayload, 2, 0);
+      LoRa.receive();
+      delay(300);     // tiempo para recibir respuesta
+
+      uint32_t txTime = millis() - t0;
+
+      Serial.print("  → Tiempo TX real: ");
+      Serial.print(txTime);
+      Serial.println(" ms");
+
+      Serial.print("  → SNR recibido: ");
       Serial.println(remoteSNR);
 
-      if (remoteSNR > bestSNR) {
-        bestSNR = remoteSNR;
-        bestConfig.spreadingFactor = sf;
-        bestConfig.bandwidth_index = bw;
+      Serial.print("  → RSSI recibido: ");
+      Serial.println(remoteRSSI);
+
+      // VALIDACIÓN SEGÚN EL ENUNCIADO
+      bool valid = true;
+
+      if (remoteSNR < MIN_SNR) valid = false;
+      if (remoteRSSI < MIN_RSSI) valid = false;
+      if (remoteSNR < -150) valid = false;   // no llegó respuesta
+
+      if (!valid) {
+        Serial.println("  → ❌ Config descartada por no cumplir SNR/RSSI.");
+        continue;
+      }
+
+      // SELECCIÓN POR MENOR TIEMPO (OBJETIVO DEL ENUNCIADO)
+      if (txTime < best.txTime) {
+        best.sf   = sf;
+        best.bw   = bw;
+        best.txTime = txTime;
+        best.snr  = remoteSNR;
+        best.rssi = remoteRSSI;
+        best.valid = true;
+
+        Serial.println("  → ✔ Nueva mejor configuración (tiempo más bajo).");
       }
     }
   }
 
-  // aplicar mejor configuración
-  thisNodeConf.spreadingFactor = bestConfig.spreadingFactor;
-  thisNodeConf.bandwidth_index = bestConfig.bandwidth_index;
+  // APLICAR CONFIGURACIÓN ÓPTIMA
+  if (!best.valid) {
+    Serial.println("\n⚠ No se encontró ninguna configuración válida. Manteniendo valores actuales.");
+    configSyncDone = true;
+    return;
+  }
 
-  LoRa.setSpreadingFactor(thisNodeConf.spreadingFactor);
-  LoRa.setSignalBandwidth(long(bandwidth_kHz[thisNodeConf.bandwidth_index]));
-  delay(5);
+  thisNodeConf.spreadingFactor = best.sf;
+  thisNodeConf.bandwidth_index = best.bw;
 
-  // enviar configuración final (msgId = 1)
-  uint8_t finalPayload[2] = { thisNodeConf.spreadingFactor, thisNodeConf.bandwidth_index };
+  LoRa.setSpreadingFactor(best.sf);
+  LoRa.setSignalBandwidth((long)bandwidth_kHz[best.bw]);
+  delay(6);
+
+  uint8_t finalPayload[2] = {best.sf, best.bw};
   sendMessageBlocking(finalPayload, 2, 1);
   LoRa.receive();
 
+  Serial.println("\n=== CONFIGURACIÓN ÓPTIMA SELECCIONADA ===");
+  Serial.print("SF = ");
+  Serial.println(best.sf);
+  Serial.print("BW = ");
+  Serial.println(best.bw);
+  Serial.print("Tiempo TX = ");
+  Serial.print(best.txTime);
+  Serial.println(" ms");
+  Serial.print("SNR = ");
+  Serial.println(best.snr);
+  Serial.print("RSSI = ");
+  Serial.println(best.rssi);
+  Serial.println("=========================================\n");
+
   configSyncDone = true;
-  Serial.println("Best config selected:");
-  Serial.println("SF=" + String(bestConfig.spreadingFactor) +
-                 " BWidx=" + String(bestConfig.bandwidth_index) +
-                 " SNR=" + String(bestSNR));
 }
