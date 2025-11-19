@@ -188,7 +188,7 @@ void onReceive(int packetSize)
   int recipient = LoRa.read();          // Dirección del destinatario
   uint8_t sender = LoRa.read();         // Dirección del remitente
                                         // msg ID (High Byte first)
-  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 7) | 
+  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 8) | 
                             (uint16_t)LoRa.read();
   
   uint8_t incomingLength = LoRa.read(); // Longitud en bytes del mensaje
