@@ -105,33 +105,56 @@ void nextConfigFromSlave(const LoRaConfig_t *current,
     Decodifica el paquete recibido desde el esclavo
     y serializa la configuración del nodo, el RSSI y el SNR
 */
-void decode_from_slave(const uint8_t *package, LoRaConfig_t * node, int *rssi, float *snr){
+void decode_from_master(const uint8_t *package, LoRaConfig_t * node){
     node->bandwidth_index = package[0] >> 4;
     node->spreadingFactor = 6 + ((package[0] & 0x0F) >> 1);
     node->codingRate = 5 + (package[1] >> 6);
     node->txPower = 2 + ((package[1] & 0x3F) >> 1);
-    *rssi = -int(package[2]) / 2.0f;
-    *snr  =  float(package[3]) - 148;
 }
 
 /*
     Codifica el paquete a enviar al esclavo
     a partir de la configuración actual del nodo maestro
     y la configuración sugerida para el siguiente estado.
-    Input: previous_config, rssi, snr
-    Output: next_config, package
+    Input: config, rssi, snr
+    Output: package
     Returns: length of the package
 */
-uint8_t encode_from_master(LoRaConfig_t * previous_config, int rssi, float snr, uint8_t *package, LoRaConfig_t * next_config){
-
-  nextConfigFromSlave(previous_config, rssi, snr, next_config);
+uint8_t encode_from_slave(LoRaConfig_t * config, int rssi, float snr, uint8_t *package){
   uint8_t length = 0;
 
-  package[length]    = (next_config->bandwidth_index << 4);
-  package[length++] |= ((next_config->spreadingFactor - 6) << 1);
-  package[length]    = ((next_config->codingRate - 5) << 6);
-  package[length++] |= ((next_config->txPower - 2) << 1);
+  package[length]    = (config->bandwidth_index << 4);
+  package[length++] |= ((config->spreadingFactor - 6) << 1);
+  package[length]    = ((config->codingRate - 5) << 6);
+  package[length++] |= ((config->txPower - 2) << 1);
+  package[length++] = rssi;
+  package[length++] = snr;
     
   return length;
+}
+
+
+void configureLoRa(LoRaConfig_t * config){
+    LoRa.idle();
+    LoRa.setSignalBandwidth(long(bandwidth_kHz[config->bandwidth_index])); 
+                                    // 7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3
+                                    // 41.7E3, 62.5E3, 125E3, 250E3, 500E3 
+                                    // Multiplicar por dos el ancho de banda
+                                    // supone dividir a la mitad el tiempo de Tx
+                                    
+    LoRa.setSpreadingFactor(config->spreadingFactor);     
+                                    // [6, 12] Aumentar el spreading factor incrementa 
+                                    // de forma significativa el tiempo de Tx
+                                    // SPF = 6 es un valor especial
+                                    // Ver tabla 12 del manual del SEMTECH SX1276
+    
+    LoRa.setCodingRate4(config->codingRate);         
+                                    // [5, 8] 5 da un tiempo de Tx menor
+                                    
+    LoRa.setTxPower(config->txPower, PA_OUTPUT_PA_BOOST_PIN); 
+                                    // Rango [2, 20] en dBm
+                                    // Importante seleccionar un valor bajo para pruebas
+                                    // a corta distancia y evitar saturar al receptor
+    LoRa.receive();
 }
 

@@ -144,7 +144,7 @@ uint8_t encode_config_to_package(LoRaConfig_t * initial_config, uint8_t *package
 
 
 void configureLoRa(LoRaConfig_t * config){
-    LoRa.idle()
+    LoRa.idle();
     LoRa.setSignalBandwidth(long(bandwidth_kHz[config->bandwidth_index])); 
                                     // 7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3
                                     // 41.7E3, 62.5E3, 125E3, 250E3, 500E3 

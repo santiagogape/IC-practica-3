@@ -26,7 +26,9 @@
 // FLAGS
 // --------------------------------------------------------------------
 
-volatile bool FIRST_EXCHANGE = true;       // Flag para indicar cuando ha finalizado una transmisión
+volatile bool PROTOCOL_START = true;       // Flag para indicar cuando ha empezado el protocolo y esperar una LoRaConfig+RSSI+SNR
+volatile bool PROTOCOL_SYNC = false;      // cuando se envia la nueva configuarcion y espera confirmacion de LoRaConfig
+
 
 // --------------------------------------------------------------------
 // Setup function
@@ -106,13 +108,11 @@ void loop()
       
   if (!transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
     uint8_t payload[10];
-    LoRaConfig_t currentConfig = thisNodeConf;
-    LoRaConfig_t nextConfig;
-    if (FIRST_EXCHANGE) {
-      uint8_t payloadLength = encode_config_to_package(&currentConfig, payload);
-    } else {
-      uint8_t payloadLength = encode_from_master(&currentConfig, remoteRSSI, remoteSNR, payload, &nextConfig);
-      configureLoRa(&nextConfig);
+    uint8_t payloadLength;
+    if (PROTOCOL_START) {
+      payloadLength = encode_config_to_package(&thisNodeConf, payload);
+    } else  { //if( PROTOCOL_SYNC)
+      payloadLength = encode_from_master(&thisNodeConf, remoteRSSI, remoteSNR, payload, &nextConf);
     }
 
     transmitting = true;
@@ -229,7 +229,17 @@ void onReceive(int packetSize)
   if (receivedBytes == 4) {
 
     decode_from_slave(buffer, &remoteNodeConf, &remoteRSSI, &remoteSNR);
-    if (FIRST_EXCHANGE) FIRST_EXCHANGE = false;
+    if (PROTOCOL_START) {
+      PROTOCOL_START = false;
+      PROTOCOL_SYNC = true;
+    } else if (PROTOCOL_SYNC) {
+      PROTOCOL_START = true;
+      PROTOCOL_SYNC = false;
+      if (EqualConfig(&remoteNodeConf, &nextConf)){ //si esto no funciona, moverlo al loop con false,false
+        configureLoRa(&nextConf);
+        thisNodeConf = nextConf;
+      }
+    }
   
   
     Serial.print("Remote config: BW: ");

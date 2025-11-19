@@ -13,7 +13,16 @@ typedef struct {
   uint8_t spreadingFactor;
   uint8_t codingRate;
   uint8_t txPower; 
+
 } LoRaConfig_t;
+
+inline bool EqualConfig(LoRaConfig_t * a, LoRaConfig_t * b){
+  return a->bandwidth_index == b->bandwidth_index &&
+         a->spreadingFactor  == b->spreadingFactor  &&
+         a->codingRate       == b->codingRate       &&
+         a->txPower          == b->txPower;
+
+}
 
 double bandwidth_kHz[10] = {7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3,
                             41.7E3, 62.5E3, 125E3, 250E3, 500E3 };
@@ -36,9 +45,8 @@ float remoteSNR = 0;
     }
 */
 
-void nextConfigFromSlave(const LoRaConfig_t *current,
-                         int rssi, float snr,
-                         LoRaConfig_t *next);
 
-void decode_from_slave(const uint8_t *package, LoRaConfig_t * node, int *rssi, float *snr);
-uint8_t encode_from_master(LoRaConfig_t * previous_config, int rssi, float snr, uint8_t *package, LoRaConfig_t * next_config);
+void decode_from_master(const uint8_t *package, LoRaConfig_t * node);
+uint8_t encode_from_slave(LoRaConfig_t * config, int rssi, float snr, uint8_t *package);
+
+void configureLoRa(LoRaConfig_t * config);

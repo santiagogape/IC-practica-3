@@ -22,6 +22,9 @@
 #include <Arduino_PMIC.h>
 #include "protocol.h"
 
+volatile bool RECEIVED = false;
+volatile bool current = true;
+
 // --------------------------------------------------------------------
 // Setup function
 // --------------------------------------------------------------------
@@ -98,27 +101,18 @@ void loop()
   static uint32_t txInterval_ms = TX_LAPSE_MS;
   static uint32_t tx_begin_ms = 0;
       
-  if (!transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
+  if (RECEIVED && !transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
 
     uint8_t payload[50];
-    uint8_t payloadLength = 0;
-
-    payload[payloadLength]    = (thisNodeConf.bandwidth_index << 4);
-    payload[payloadLength++] |= ((thisNodeConf.spreadingFactor - 6) << 1);
-    payload[payloadLength]    = ((thisNodeConf.codingRate - 5) << 6);
-    payload[payloadLength++] |= ((thisNodeConf.txPower - 2) << 1);
-
-    // Incluimos el RSSI y el SNR del último paquete recibido
-    // RSSI puede estar en un rango de [0, -127] dBm
-    payload[payloadLength++] = uint8_t(-LoRa.packetRssi() * 2);
-    // SNR puede estar en un rango de [20, -148] dBm
-    payload[payloadLength++] = uint8_t(148 + LoRa.packetSnr());
+    uint8_t payloadLength = encode_from_slave(&thisNodeConf,uint8_t(-LoRa.packetRssi() * 2),uint8_t(148 + LoRa.packetSnr()),payload);
     
     transmitting = true;
     txDoneFlag = false;
     tx_begin_ms = millis();
   
     sendMessage(payload, payloadLength, msgCount);
+    RECEIVED = false;
+    if (!current) configureLoRa(&thisNodeConf);
     Serial.print("Sending packet ");
     Serial.print(msgCount++);
     Serial.print(": ");
@@ -211,6 +205,7 @@ void onReceive(int packetSize)
     return;
   }
 
+  RECEIVED = true;
   // Imprimimos los detalles del mensaje recibido
   Serial.println("Received from: 0x" + String(sender, HEX));
   Serial.println("Sent to: 0x" + String(recipient, HEX));
@@ -223,13 +218,11 @@ void onReceive(int packetSize)
   Serial.println(" dB");
 
   // Actualizamos remoteNodeConf y lo mostramos
-  if (receivedBytes == 4) {
+  if (receivedBytes == 2) {
     remoteNodeConf.bandwidth_index = buffer[0] >> 4;
     remoteNodeConf.spreadingFactor = 6 + ((buffer[0] & 0x0F) >> 1);
     remoteNodeConf.codingRate = 5 + (buffer[1] >> 6);
     remoteNodeConf.txPower = 2 + ((buffer[1] & 0x3F) >> 1);
-    remoteRSSI = -int(buffer[2]) / 2.0f;
-    remoteSNR  =  int(buffer[3]) - 148;
   
     Serial.print("Remote config: BW: ");
     Serial.print(bandwidth_kHz[remoteNodeConf.bandwidth_index]);
@@ -239,11 +232,11 @@ void onReceive(int packetSize)
     Serial.print(remoteNodeConf.codingRate);
     Serial.print(", TxPwr: ");
     Serial.print(remoteNodeConf.txPower);
-    Serial.print(" dBm, RSSI: ");
-    Serial.print(remoteRSSI);
-    Serial.print(" dBm, SNR: ");
-    Serial.print(remoteSNR,1);
-    Serial.println(" dB\n");
+
+    if (!EqualConfig(&thisNodeConf,&remoteNodeConf)){
+      current = false;
+    }
+  
   }
   else {
     Serial.print("Unexpected payload size: ");
