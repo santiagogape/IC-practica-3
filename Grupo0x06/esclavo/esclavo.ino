@@ -43,8 +43,9 @@ LoRaConfig_t thisNodeConf = { 7, 9, 5, 14 }; // ejemplo: BW idx=7 (125kHz), SF=9
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
 
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // Enciende el LED integrado
   Serial.println("LoRa Slave for AutoAdjust - starting...");
 
   if (!init_PMIC()) {
