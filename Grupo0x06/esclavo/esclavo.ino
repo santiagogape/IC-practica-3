@@ -302,3 +302,214 @@ void onReceive(int packetSize) {
     }
     receivedBytes--;
   }
+  
+  // MENSAJE DE SINCRONIZACIÓN
+  if (msgType == MSG_SYNC && !syncedWithMaster) {
+    Serial.println("\n╔═══════════════════════════════════════════════════╗");
+    Serial.println("║        ✓ SINCRONIZADO CON EL MAESTRO!            ║");
+    Serial.println("╚═══════════════════════════════════════════════════╝");
+    
+    Serial.print("Config de sync: BW=");
+    Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
+    Serial.print(" kHz, SF=");
+    Serial.print(thisNodeConf.spreadingFactor);
+    Serial.print(" | RSSI: ");
+    Serial.print(rssi);
+    Serial.print(" dBm, SNR: ");
+    Serial.print(snr, 1);
+    Serial.println(" dB\n");
+    
+    syncedWithMaster = true;
+    digitalWrite(LED_BUILTIN, HIGH);
+    
+    // Responder al maestro
+    uint8_t syncReply[2] = {0xBB, 0xCC};
+    LoRa.beginPacket();
+    LoRa.write(sender);
+    LoRa.write(localAddress);
+    LoRa.write(MSG_DATA);
+    LoRa.write(0);
+    LoRa.write(0);
+    LoRa.write(2);
+    LoRa.write(syncReply, 2);
+    LoRa.write(calculateCRC(syncReply, 2));
+    LoRa.endPacket();
+    
+    LoRa.receive();
+    return;
+  }
+  
+  // Solo procesar otros mensajes si ya está sincronizado
+  if (!syncedWithMaster && msgType != MSG_SYNC) {
+    return;
+  }
+  
+  Serial.println("\n┌─────────────────────────────────────────┐");
+  Serial.print("│ RX from 0x");
+  Serial.print(sender, HEX);
+  Serial.print(" | Type: ");
+  Serial.print(msgType);
+  Serial.print(" | ID: ");
+  Serial.print(incomingMsgId);
+  Serial.println("    │");
+  Serial.print("│ RSSI: ");
+  Serial.print(rssi);
+  Serial.print(" dBm | SNR: ");
+  Serial.print(snr, 1);
+  Serial.println(" dB       │");
+  Serial.println("└─────────────────────────────────────────┘");
+  
+  switch (msgType) {
+    
+    case MSG_CALIBRATION:
+      stats.calibrationRequests++;
+      Serial.println("→ Calibration request received");
+      
+      // Durante calibración, el maestro puede cambiar los parámetros
+      // Adaptarse automáticamente si detectamos que el maestro cambió
+      if (receivedBytes >= 4) {
+        uint8_t testSF = buffer[2];
+        uint8_t testBW = buffer[3];
+        
+        // Si detectamos parámetros diferentes, adaptarnos
+        if (testSF != thisNodeConf.spreadingFactor || 
+            testBW != thisNodeConf.bandwidth_index) {
+          
+          Serial.print("→ Adaptando a config de prueba: SF=");
+          Serial.print(testSF);
+          Serial.print(" BW=");
+          Serial.println(testBW);
+          
+          thisNodeConf.spreadingFactor = testSF;
+          thisNodeConf.bandwidth_index = testBW;
+          
+          LoRa.setSpreadingFactor(testSF);
+          LoRa.setSignalBandwidth((long)bandwidth_kHz[testBW]);
+          delay(10);
+        }
+      }
+      
+      sendCalibrationResponse(sender, rssi, snr);
+      LoRa.receive();
+      break;
+      
+    case MSG_CONFIG_FINAL:
+      Serial.println("→ Final configuration received");
+      
+      if (receivedBytes >= 3) {
+        uint8_t newSF = buffer[0];
+        uint8_t newBW = buffer[1];
+        uint8_t newCR = buffer[2];
+        
+        if (applyNewConfig(newSF, newBW, newCR)) {
+          sendACK(sender, incomingMsgId);
+          LoRa.receive();
+        }
+      } else {
+        Serial.println("✗ Config message too short");
+      }
+      break;
+      
+    case MSG_DATA:
+      Serial.println("→ Data message received");
+      
+      sendACK(sender, incomingMsgId);
+      
+      if (receivedBytes > 0) {
+        Serial.print("Payload (");
+        Serial.print(receivedBytes);
+        Serial.print(" bytes): ");
+        for (int i = 0; i < receivedBytes; i++) {
+          Serial.print("0x");
+          if (buffer[i] < 0x10) Serial.print("0");
+          Serial.print(buffer[i], HEX);
+          Serial.print(" ");
+        }
+        Serial.println();
+        
+        if (receivedBytes == 4) {
+          uint8_t remoteBW = buffer[0] >> 4;
+          uint8_t remoteSF = 6 + ((buffer[0] & 0x0F) >> 1);
+          uint8_t remoteCR = 5 + (buffer[1] >> 6);
+          uint8_t remotePwr = 2 + ((buffer[1] & 0x3F) >> 1);
+          int remoteRSSI = -int(buffer[2]) / 2;
+          float remoteSNR = int(buffer[3]) - 148;
+          
+          Serial.print("Master status: BW=");
+          Serial.print((int)bandwidth_kHz[remoteBW]);
+          Serial.print(" kHz, SF=");
+          Serial.print(remoteSF);
+          Serial.print(", CR=4/");
+          Serial.print(remoteCR);
+          Serial.print(", Pwr=");
+          Serial.print(remotePwr);
+          Serial.print(" dBm, RSSI=");
+          Serial.print(remoteRSSI);
+          Serial.print(" dBm, SNR=");
+          Serial.print(remoteSNR, 1);
+          Serial.println(" dB");
+        }
+      }
+      
+      LoRa.receive();
+      break;
+      
+    case MSG_ACK:
+      Serial.println("→ ACK received");
+      LoRa.receive();
+      break;
+      
+    default:
+      Serial.print("→ Unknown message type: ");
+      Serial.println(msgType);
+      LoRa.receive();
+      break;
+  }
+}
+
+void onTxDone() {
+  transmitting = false;
+  txDoneFlag = true;
+}
+
+void printStats() {
+  Serial.println("\n╔═══════════════════════════════════════════════════╗");
+  Serial.println("║                  STATISTICS                       ║");
+  Serial.println("╠═══════════════════════════════════════════════════╣");
+  
+  if (!syncedWithMaster) {
+    Serial.print("║ Sync attempts:          ");
+    Serial.print(stats.syncAttempts);
+    Serial.println("                         ║");
+    Serial.println("║ Status:                 NOT SYNCED               ║");
+  } else {
+    Serial.println("║ Status:                 SYNCED ✓                 ║");
+    Serial.print("║ Packets received:       ");
+    Serial.print(stats.packetsReceived);
+    Serial.println("                         ║");
+    Serial.print("║ Packets sent:           ");
+    Serial.print(stats.packetsSent);
+    Serial.println("                         ║");
+    Serial.print("║ CRC errors:             ");
+    Serial.print(stats.crcErrors);
+    Serial.println("                         ║");
+    Serial.print("║ Calibration requests:   ");
+    Serial.print(stats.calibrationRequests);
+    Serial.println("                         ║");
+  }
+  
+  Serial.println("╠═══════════════════════════════════════════════════╣");
+  Serial.print("║ Current SF:             ");
+  Serial.print(thisNodeConf.spreadingFactor);
+  Serial.println("                         ║");
+  Serial.print("║ Current BW:             ");
+  Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
+  Serial.println(" kHz                   ║");
+  Serial.print("║ Current CR:             4/");
+  Serial.print(thisNodeConf.codingRate);
+  Serial.println("                       ║");
+  Serial.print("║ Current Power:          ");
+  Serial.print(thisNodeConf.txPower);
+  Serial.println(" dBm                     ║");
+  Serial.println("╚═══════════════════════════════════════════════════╝\n");
+}
