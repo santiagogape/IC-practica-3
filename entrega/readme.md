@@ -1,8 +1,9 @@
 # PRACTICA 3 - LORA
-+ Alberto Martel Rodríguez
-+ Jose
-+ Nicolás Rey Alfonso
-+ Santiago Galindo Peralta
++ Galindo Peralta, Santiago
++ Manuel Díaz Hernández, Jose
++ Martel Rodríguez, Alberto
++ Rey Alfonso, Nicolás 
+ 
 
 ---
 # Protocolo LoRa V3: Sincronización, Calibración, Configuración Óptima y Estabilidad
