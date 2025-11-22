@@ -1,6 +1,6 @@
 # PRACTICA 3 - LORA
 + Galindo Peralta, Santiago
-+ Manuel Díaz Hernández, Jose
++ Manuel Díaz Hernández, José
 + Martel Rodríguez, Alberto
 + Rey Alfonso, Nicolás 
  
