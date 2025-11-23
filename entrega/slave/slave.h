@@ -80,3 +80,7 @@ void onTxDone();
  * Envía un ACK genérico al maestro para un msgId recibido (MSG_ACK_shared).
  */
 void sendACK_slave(uint8_t recipient, uint16_t msgId);
+
+
+void rotateSyncConfig_slave();
+

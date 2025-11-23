@@ -1,3 +1,6 @@
+#ifndef LORA_PROTOCOL_SHARED_H
+#define LORA_PROTOCOL_SHARED_H
+
 #include <LoRa.h>
 
 /**
@@ -17,11 +20,16 @@ static const uint32_t TIMEOUT_SYNC_FAST_MS_shared   = 10000UL; // FAST_SYNC (V3)
 static const uint32_t TIMEOUT_CALIBRATION_MS_shared = 10000UL; // esperar respuesta calibración
 static const uint32_t TIMEOUT_CONFIG_MS_shared      = 10000UL; // esperar confirm config final
 static const uint32_t TIMEOUT_RECOVERY_MS_shared    = 10000UL; // fase de recuperación
+/** Tiempo máximo para intentar sincronizar usando SAFE (corta distancia): 10 s */
+const uint32_t TIMEOUT_SYNC_SAFE_MS_shared = 10000UL;
 
-/**
- * Intervalo entre paquetes de sincronización en la fase SAFE (V3).
- */
-static const uint32_t SYNC_SAFE_INTERVAL_MS_shared  = 500UL;
+/** Tiempo máximo para intentar sincronizar usando LONGRANGE (larga distancia): 10 s */
+const uint32_t TIMEOUT_SYNC_LONG_MS_shared = 10000UL;
+
+/** Intervalo entre envíos de mensajes de SYNC (SAFE y LONGRANGE) */
+const uint32_t SYNC_SAFE_INTERVAL_MS_shared = 1000UL;
+
+
 
 /**
  * Tabla de anchos de banda en Hz, indexados de 0 a 9.
@@ -56,6 +64,18 @@ static const LoRaConfig_t_shared LORA_SAFE_CONFIG_shared = {
   5,  // CR = 4/5
   2   // TxPower = 2 dBm
 };
+
+
+/** Configuración "LONGRANGE" para larga distancia con ruido.
+ *  SF=12, BW=125 kHz, CR=4/8, TxPower=14 dBm
+ */
+const LoRaConfig_t_shared LORA_LONGRANGE_CONFIG_shared = {
+  7,   // bandwidth_index → 125 kHz
+  12,  // spreadingFactor
+  8,   // codingRate (4/8)
+  14   // txPower (dBm)
+};
+
 
 /**
  * Tipos de mensaje del protocolo compartido (V3).
@@ -136,3 +156,5 @@ inline void decodeConfigFromPayload_shared(const uint8_t* in2bytes, LoRaConfig_t
   cfg.codingRate      = 5 + (in2bytes[1] >> 6);
   cfg.txPower         = 2 + ((in2bytes[1] & 0x3F) >> 1);
 }
+
+#endif

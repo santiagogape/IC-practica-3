@@ -2,7 +2,6 @@
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
-#include "lora_protocol_shared.h"
 #include "slave.h"
 
 /* Variables globales del esclavo (definidas aquí, declaradas extern en slave.h) */
@@ -19,6 +18,15 @@ struct Stats_slave {
   uint32_t calibrationRequests;
 } stats_slave = {0, 0, 0, 0, 0};
 
+/* Fase interna de sincronización en el esclavo */
+enum SyncPhase_slave_t {
+  SYNC_PHASE_SAFE_slave = 0,
+  SYNC_PHASE_LONG_slave = 1
+};
+
+static SyncPhase_slave_t syncPhase_slave = SYNC_PHASE_SAFE_slave;
+static uint32_t syncPhaseStart_ms_slave  = 0;
+
 /* --------------------------------------------------------------------
  *  SETUP
  * ------------------------------------------------------------------*/
@@ -29,7 +37,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
 
-  Serial.println("\n=== LoRa SLAVE V3 - SAFE SYNC + CALIBRATION + STABLE ===");
+  Serial.println("\n=== LoRa SLAVE V3 - SYNC SAFE + LONGRANGE + CALIBRATION ===");
 
   if (!init_PMIC()) {
     Serial.println("Init PMIC failed!");
@@ -82,22 +90,52 @@ void loop() {
  * ------------------------------------------------------------------*/
 void initScanForMaster_slave() {
   syncedWithMaster_slave = false;
-  slaveMode = SCAN_FOR_MASTER;
+  slaveMode              = SCAN_FOR_MASTER;
+
+  syncPhase_slave        = SYNC_PHASE_SAFE_slave;
+  syncPhaseStart_ms_slave = millis();
+
   thisNodeConf_slave = LORA_SAFE_CONFIG_shared;
   applyLoRaConfig_shared(thisNodeConf_slave);
 
-  Serial.println("[SLAVE] SCAN_FOR_MASTER: listening with SAFE config.");
+  Serial.println("[SLAVE] SCAN_FOR_MASTER: SAFE phase (10 s) con LORA_SAFE_CONFIG_shared.");
 }
 
 /* --------------------------------------------------------------------
- *  SCAN_FOR_MASTER
+ *  SCAN_FOR_MASTER (dos fases: SAFE → LONGRANGE)
  * ------------------------------------------------------------------*/
 void handleScanForMaster_slave() {
-  digitalWrite(LED_BUILTIN, (millis() / 500) % 2); /* blink lento */
-  /* En esta versión simple, toda la lógica de escucha está en onReceive().
-   * Aquí podrías añadir rotación de configuraciones si quisieras evolucionar
-   * hacia la V2 con escaneo más complejo.
-   */
+  uint32_t now = millis();
+
+  // parpadeo lento para indicar búsqueda
+  digitalWrite(LED_BUILTIN, (now / 500) % 2);
+
+  // si ya se sincronizó por SYNC_START o por CALIBRATION, pasar a SYNCED
+  if (syncedWithMaster_slave) {
+    slaveMode = SYNCED;
+    digitalWrite(LED_BUILTIN, HIGH);
+    return;
+  }
+
+  if (syncPhase_slave == SYNC_PHASE_SAFE_slave) {
+    if (now - syncPhaseStart_ms_slave > TIMEOUT_SYNC_SAFE_MS_shared) {
+      // pasar a LONGRANGE
+      syncPhase_slave        = SYNC_PHASE_LONG_slave;
+      syncPhaseStart_ms_slave = now;
+
+      thisNodeConf_slave = LORA_LONGRANGE_CONFIG_shared;
+      applyLoRaConfig_shared(thisNodeConf_slave);
+
+      Serial.println("[SLAVE] SCAN: timeout SAFE, cambiando a fase LONGRANGE (10 s).");
+    }
+  } else { // SYNC_PHASE_LONG_slave
+    if (now - syncPhaseStart_ms_slave > TIMEOUT_SYNC_LONG_MS_shared) {
+      // no se logró SYNC ni con SAFE ni con LONGRANGE
+      Serial.println("[SLAVE] SCAN: timeout LONGRANGE, esperando que maestro entre en CALIBRATION.");
+      // Nos quedamos con config LONGRANGE, pero permitimos mensajes de CALIBRATION.
+      // No cambiamos slaveMode aún; onReceive manejará las fases siguientes.
+    }
+  }
 }
 
 /* --------------------------------------------------------------------
@@ -105,9 +143,7 @@ void handleScanForMaster_slave() {
  * ------------------------------------------------------------------*/
 void handleSynced_slave() {
   digitalWrite(LED_BUILTIN, HIGH);
-  /* La lógica principal de calibración y config está en onReceive().
-   * Este modo es más un "marcador" de estado que un procesador activo.
-   */
+  // La lógica de calibración y configuración final sucede en onReceive.
 }
 
 /* --------------------------------------------------------------------
@@ -115,9 +151,7 @@ void handleSynced_slave() {
  * ------------------------------------------------------------------*/
 void handleStable_slave() {
   digitalWrite(LED_BUILTIN, HIGH);
-  /* Igual que en SYNCED, la recepción de datos/ACK se resuelve en onReceive().
-   * Aquí podrías añadir estadísticas periódicas si lo deseas.
-   */
+  // En esta versión, la recepción de DATA/ACK se maneja en onReceive.
 }
 
 /* --------------------------------------------------------------------
@@ -135,7 +169,7 @@ void sendSyncReply_slave(uint8_t masterAddress) {
 
   stats_slave.packetsSent++;
 
-  Serial.println("[SLAVE] MSG_SYNC_REPLY_shared enviado");
+  Serial.println("[SLAVE] MSG_SYNC_REPLY_shared enviado.");
 }
 
 /* --------------------------------------------------------------------
@@ -275,14 +309,21 @@ void onReceive(int packetSize) {
     return;
   }
 
-  /* Si aún no está sincronizado, ignorar otros mensajes */
-  if (!syncedWithMaster_slave) {
+  /* Si aún no está sincronizado, solo aceptamos CALIBRATION_TEST como fallback */
+  if (!syncedWithMaster_slave && msgType != (uint8_t)MSG_CALIBRATION_TEST_shared) {
     return;
   }
 
   /* -------- CALIBRATION TEST -------- */
   if (msgType == (uint8_t)MSG_CALIBRATION_TEST_shared) {
     stats_slave.calibrationRequests++;
+
+    // Si aún no está sincronizado, consideramos que a partir de ahora hay comunicación
+    if (!syncedWithMaster_slave) {
+      syncedWithMaster_slave = true;
+      slaveMode = SYNCED;
+      Serial.println("[SLAVE] Fallback: sincronizado con maestro vía CALIBRATION_TEST.");
+    }
 
     if (receivedBytes >= 4) {
       uint8_t testSF = buffer[2];
@@ -372,7 +413,7 @@ void onReceive(int packetSize) {
     return;
   }
 
-  /* -------- ACK (generalmente ignorable en esclavo) -------- */
+  /* -------- ACK -------- */
   if (msgType == (uint8_t)MSG_ACK_shared) {
     LoRa.receive();
     return;

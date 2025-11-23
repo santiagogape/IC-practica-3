@@ -2,7 +2,6 @@
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
-#include "lora_protocol_shared.h"
 #include "master.h"
 
 #define TX_LAPSE_MS          10000UL
@@ -20,10 +19,10 @@ LoRaConfig_t_shared lastGoodConfig_master = LORA_SAFE_CONFIG_shared;
 int   remoteRSSI_master = -200;
 float remoteSNR_master  = -200.0f;
 
-volatile bool txDoneFlag_master         = true;
-volatile bool transmitting_master       = false;
-volatile bool ackReceived_master        = false;
-volatile bool syncReplyReceived_master  = false;
+volatile bool txDoneFlag_master            = true;
+volatile bool transmitting_master          = false;
+volatile bool ackReceived_master           = false;
+volatile bool syncReplyReceived_master     = false;
 volatile bool configConfirmReceived_master = false;
 
 /* Prototipo local de CRC para compat con código previo (usa versión shared). */
@@ -38,7 +37,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) { /* esperar consola */ }
 
-  Serial.println("\n=== LoRa MASTER V3 - SYNC + CALIBRATION + STABLE ===");
+  Serial.println("\n=== LoRa MASTER V3 - SYNC SAFE + LONGRANGE + CALIBRATION ===");
 
   if (!init_PMIC()) {
     Serial.println("Init PMIC failed!");
@@ -51,7 +50,7 @@ void setup() {
     }
   }
 
-  /* Config inicial SAFE (V3) */
+  /* Config inicial SAFE */
   thisNodeConf_master   = LORA_SAFE_CONFIG_shared;
   lastGoodConfig_master = thisNodeConf_master;
   applyLoRaConfig_shared(thisNodeConf_master);
@@ -89,45 +88,60 @@ void loop() {
 }
 
 /* --------------------------------------------------------------------
- *  INIT SYNC
+ *  INIT SYNC (SAFE + LONGRANGE)
  * ------------------------------------------------------------------*/
 void initFastSync_master() {
-  syncReplyReceived_master   = false;
-  configConfirmReceived_master = false;
-  ackReceived_master         = false;
+  syncReplyReceived_master      = false;
+  configConfirmReceived_master  = false;
+  ackReceived_master            = false;
 
   thisNodeConf_master   = LORA_SAFE_CONFIG_shared;
   lastGoodConfig_master = thisNodeConf_master;
   applyLoRaConfig_shared(thisNodeConf_master);
 
-  Serial.println("[MASTER] SYNC: using SAFE config (SF7, BW125kHz, CR4/5, Pwr=2dBm)");
+  Serial.println("[MASTER] SYNC: SAFE phase using LORA_SAFE_CONFIG_shared");
 }
 
 /* --------------------------------------------------------------------
- *  SYNC (V3)
+ *  SYNC (dos fases: SAFE → LONGRANGE)
  * ------------------------------------------------------------------*/
 void handleFastSync_master() {
-  static bool initialized = false;
-  static uint32_t fastSyncStart_ms = 0;
-  static uint32_t lastSyncSent_ms  = 0;
+  enum SyncPhase {
+    SYNC_PHASE_SAFE = 0,
+    SYNC_PHASE_LONG = 1
+  };
+  static bool initialized           = false;
+  static SyncPhase phase            = SYNC_PHASE_SAFE;
+  static uint32_t phaseStart_ms     = 0;
+  static uint32_t lastSyncSent_ms   = 0;
 
   uint32_t now = millis();
 
   if (!initialized) {
-    fastSyncStart_ms = now;
-    lastSyncSent_ms  = 0;
+    phase          = SYNC_PHASE_SAFE;
+    phaseStart_ms  = now;
+    lastSyncSent_ms = 0;
+
+    thisNodeConf_master = LORA_SAFE_CONFIG_shared;
+    applyLoRaConfig_shared(thisNodeConf_master);
+
+    Serial.println("[MASTER] SYNC: starting SAFE phase (10 s).");
     initialized = true;
   }
 
+  /* Si ya recibimos SYNC_REPLY, pasamos a CALIBRATION */
   if (syncReplyReceived_master) {
-    Serial.println("[MASTER] SYNC: SYNC_REPLY recibido, pasando a CALIBRATION");
-    masterMode = CALIBRATION;
+    Serial.println("[MASTER] SYNC: SYNC_REPLY recibido, pasando a CALIBRATION.");
+    masterMode  = CALIBRATION;
     initialized = false;
     return;
   }
 
+  /* Enviar periódicamente MSG_SYNC_START_shared */
   if (now - lastSyncSent_ms >= SYNC_SAFE_INTERVAL_MS_shared) {
-    Serial.println("[MASTER] SYNC: enviando MSG_SYNC_START_shared");
+    Serial.print("[MASTER] SYNC: enviando MSG_SYNC_START_shared en fase ");
+    Serial.println((phase == SYNC_PHASE_SAFE) ? "SAFE" : "LONGRANGE");
+
     LoRa.beginPacket();
     LoRa.write(SLAVE_ADDRESS_shared);        // destinatario
     LoRa.write(MASTER_ADDRESS_shared);       // remitente
@@ -141,10 +155,25 @@ void handleFastSync_master() {
     lastSyncSent_ms = now;
   }
 
-  if (now - fastSyncStart_ms > TIMEOUT_SYNC_FAST_MS_shared) {
-    Serial.println("[MASTER] SYNC: timeout sin SYNC_REPLY, pasando a CALIBRATION de todas formas.");
-    masterMode = CALIBRATION;
-    initialized = false;
+  /* Gestión de fases y timeouts */
+  if (phase == SYNC_PHASE_SAFE) {
+    if (now - phaseStart_ms > TIMEOUT_SYNC_SAFE_MS_shared) {
+      /* Pasar a LONGRANGE */
+      phase          = SYNC_PHASE_LONG;
+      phaseStart_ms  = now;
+      lastSyncSent_ms = 0;
+
+      thisNodeConf_master = LORA_LONGRANGE_CONFIG_shared;
+      applyLoRaConfig_shared(thisNodeConf_master);
+
+      Serial.println("[MASTER] SYNC: timeout SAFE, cambiando a fase LONGRANGE (10 s).");
+    }
+  } else { /* SYNC_PHASE_LONG */
+    if (now - phaseStart_ms > TIMEOUT_SYNC_LONG_MS_shared) {
+      Serial.println("[MASTER] SYNC: timeout LONGRANGE, pasando a CALIBRATION de todas formas.");
+      masterMode  = CALIBRATION;
+      initialized = false;
+    }
   }
 }
 
@@ -225,10 +254,6 @@ void handleStable_master() {
  *  RECOVERY (esqueleto)
  * ------------------------------------------------------------------*/
 void handleRecovery_master() {
-  /* Por ahora no implementamos lógica avanzada de RECOVERY.
-   * Podrás añadir aquí rollback a lastGoodConfig_master y
-   * comprobaciones extra cuando quieras evolucionar a V4.
-   */
   Serial.println("[MASTER] RECOVERY state not implemented yet.");
   masterMode = STABLE;
 }
