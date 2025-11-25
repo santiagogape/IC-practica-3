@@ -1,487 +1,239 @@
 /* ---------------------------------------------------------------------
- *  Versión MEJORADA con seguridad y exploración exhaustiva de configs
+ *  Ejemplo MKR1310_LoRa_SendReceive_WithCallbacks
+ *  Práctica 3
+ *  Asignatura (GII-IoT)
+ *  
+ *  Basado en el ejemplo MKR1310_LoRa_SendReceive_WithReceiveCallback,
+ *  muestra cómo es posible resolver la transmisión  
+ *  y recepción de mensajes de forma asíncrona.
+ *  Adicionalmente, monitorea el duty-cycle e intenta
+ *  ajustar el intervalo entre la transmisión de paquetes
+ *  para mantener el duty cycle por debajo del 1%.
+ *  
+ *  
+ *  Este ejemplo requiere de una versión modificada
+ *  de la librería Arduino LoRa (descargable desde 
+ *  CV de la asignatura.
+ *  
+ *  También usa la librería Arduino_BQ24195 
+ *  https://github.com/arduino-libraries/Arduino_BQ24195
  * ---------------------------------------------------------------------
  */
 
-#include <SPI.h>
+#include <SPI.h>             
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
 #define TX_LAPSE_MS          10000
-#define MAX_RETRIES          3
-#define ACK_TIMEOUT_MS       500
-#define CALIBRATION_RETRIES  2
 
-const uint8_t localAddress = 0x06;
-uint8_t destination = 0x05;
+// NOTA: Ajustar estas variables 
+const uint8_t localAddress = 0x48;     // Dirección de este dispositivo
+uint8_t destination = 0xFF;            // Dirección de destino, 0xFF es la dirección de broadcast
 
-// Tipos de mensaje
-enum MessageType {
-  MSG_CALIBRATION = 0x01,
-  MSG_CONFIG_FINAL = 0x02,
-  MSG_DATA = 0x03,
-  MSG_ACK = 0x04
-};
+volatile bool txDoneFlag = true;       // Flag para indicar cuando ha finalizado una transmisión
 
-volatile bool txDoneFlag = true;
-volatile bool transmitting = false;
-volatile bool ackReceived = false;
+// --------------------------------------------------------------------
+// Setup function
+// --------------------------------------------------------------------
+void setup() 
+{
+  Serial.begin(9600);  
+  while (!Serial); 
 
-bool configSyncDone = false;
+  Serial.println("LoRa Duplex with TxDone and Receive callbacks");
 
-typedef struct {
-  uint8_t bandwidth_index;
-  uint8_t spreadingFactor;
-  uint8_t codingRate;
-  uint8_t txPower;
-} LoRaConfig_t;
+  // Es posible indicar los pines para CS, reset e IRQ pins (opcional)
+  // LoRa.setPins(csPin, resetPin, irqPin);// set CS, reset, IRQ pin
 
-double bandwidth_kHz[10] = {7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3,
-                            41.7E3, 62.5E3, 125E3, 250E3, 500E3 };
-
-LoRaConfig_t thisNodeConf   = { 6, 10, 5, 2};
-LoRaConfig_t remoteNodeConf = { 0,  0, 0, 0};
-int remoteRSSI = 0;
-float remoteSNR = -200.0f;
-
-void setup() {
-  Serial.begin(115200);
-  while(!Serial) delay(10);
   
-  Serial.println("\n=== LoRa Duplex MEJORADO - AutoAdjust Seguro ===");
-
   if (!init_PMIC()) {
-    Serial.println("Init PMIC failed!");
+    Serial.println("Initilization of BQ24195L failed!");
+  }
+  else {
+    Serial.println("Initilization of BQ24195L succeeded!");
   }
 
-  if (!LoRa.begin(868E6)) {
+  if (!LoRa.begin(868E6)) {      // Initicializa LoRa a 868 MHz
     Serial.println("LoRa init failed. Check your connections.");
-    while (true);
+    while (true);                
   }
 
-  LoRa.setSignalBandwidth(long(bandwidth_kHz[thisNodeConf.bandwidth_index]));
-  LoRa.setSpreadingFactor(thisNodeConf.spreadingFactor);
-  LoRa.setCodingRate4(thisNodeConf.codingRate);
-  LoRa.setTxPower(thisNodeConf.txPower, PA_OUTPUT_PA_BOOST_PIN);
-  LoRa.setSyncWord(0x12);
-  LoRa.setPreambleLength(8);
+  // Configuramos algunos parámetros de la radio
+  LoRa.setSignalBandwidth(125E3); // 7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3
+                                  // 41.7E3, 62.5E3, 125E3, 250E3, 500E3 
+                                  // Multiplicar por dos el ancho de banda
+                                  // supone dividir a la mitad el tiempo de Tx
+  LoRa.setSpreadingFactor(12);     // [6, 12] Aumentar el spreading factor incrementa 
+  // original 7, nosotros 12
+  /*
+    //12
+    Sending 'Message no. 000 from 0xBB' ----> TX completed in 1652 msecs
+    Duty cycle: 16.5 %
 
+    Received from: 0x13
+    Sent to: 0xff
+    Message ID: 2
+    Message length: 15
+    Message: Roberto trabaja
+    RSSI: -85 dBm
+    SNR: 8.00
+  */
+                                  // de forma significativa el tiempo de Tx
+                                  // SPF = 6 es un valor especial
+                                  // Ver tabla 12 del manual del SEMTECH SX1276
+  LoRa.setSyncWord(0x12);         // Palabra de sincronización privada por defecto para SX127X 
+                                  // Usaremos la palabra de sincronización para crear diferentes
+                                  // redes privadas por equipos
+  LoRa.setCodingRate4(5);         // [5, 8] 5 da un tiempo de Tx menor
+  LoRa.setPreambleLength(8);      // Número de símbolos a usar como preámbulo
+
+  LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN); // Rango [2, 20] en dBm
+                                  // Importante seleccionar un valor bajo para pruebas
+                                  // a corta distancia y evitar saturar al receptor
+
+  // Indicamos el callback para cuando se reciba un paquete
   LoRa.onReceive(onReceive);
-  LoRa.onTxDone(TxFinished);
+  
+  // Nótese que la recepción está activada a partir de este punto
   LoRa.receive();
 
-  Serial.println("LoRa init succeeded.\n");
+  // Activamos el callback que nos indicará cuando ha finalizado la 
+  // transmisión de un mensaje
+  LoRa.onTxDone(TxFinished);
+
+  Serial.println("LoRa init succeeded.");
 }
 
-void loop() {
+// --------------------------------------------------------------------
+// Loop function
+// --------------------------------------------------------------------
+void loop() 
+{
   static uint32_t lastSendTime_ms = 0;
   static uint16_t msgCount = 0;
   static uint32_t txInterval_ms = TX_LAPSE_MS;
   static uint32_t tx_begin_ms = 0;
-
-  if (!configSyncDone) {
-    autoAdjustConfigImproved();
-    return;
-  }
-
+  static bool transmitting = false;
+  
   if (!transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
-    uint8_t payload[50];
-    uint8_t payloadLength = 0;
 
-    payload[payloadLength]    = (thisNodeConf.bandwidth_index << 4);
-    payload[payloadLength++] |= ((thisNodeConf.spreadingFactor - 6) << 1);
-    payload[payloadLength]    = ((thisNodeConf.codingRate - 5) << 6);
-    payload[payloadLength++] |= ((thisNodeConf.txPower - 2) << 1);
+    char message[50];
 
-    payload[payloadLength++] = uint8_t(-LoRa.packetRssi() * 2);
-    payload[payloadLength++] = uint8_t(148 + LoRa.packetSnr());
+    snprintf(message, sizeof(message),"Message no. %03d from 0x%02X", 
+             msgCount, localAddress);
 
     transmitting = true;
     txDoneFlag = false;
     tx_begin_ms = millis();
-
-    // Envío con reintentos
-    bool success = sendMessageWithRetry(payload, payloadLength, msgCount, MSG_DATA);
-    
-    if (success) {
-      Serial.print("✓ Packet ");
-      Serial.print(msgCount++);
-      Serial.println(" sent successfully");
-    } else {
-      Serial.print("✗ Packet ");
-      Serial.print(msgCount);
-      Serial.println(" failed after retries");
-    }
-  }
-
+  
+    sendMessage(message, uint8_t(strlen(message)), msgCount);
+    Serial.print("Sending '");
+    Serial.print(message);
+    Serial.print("' ");
+  }                  
+  
   if (transmitting && txDoneFlag) {
     uint32_t TxTime_ms = millis() - tx_begin_ms;
-    Serial.print("TX completed in ");
+    Serial.print("----> TX completed in ");
     Serial.print(TxTime_ms);
-    Serial.println(" ms");
-
+    Serial.println(" msecs");
+    
+    // Ajustamos txInterval_ms para respetar un duty cycle del 1% 
     uint32_t lapse_ms = tx_begin_ms - lastSendTime_ms;
-    lastSendTime_ms = tx_begin_ms;
+    lastSendTime_ms = tx_begin_ms; 
     float duty_cycle = (100.0f * TxTime_ms) / lapse_ms;
-
+    
     Serial.print("Duty cycle: ");
-    Serial.print(duty_cycle, 1);
+    Serial.print(duty_cycle,1);
     Serial.println(" %\n");
 
-    if (duty_cycle > 1.0f) {
+    // Solo si el ciclo de trabajo es superior al 1% lo ajustamos
+    // Dejamos random() solo para introducir cierta variabilidad
+    // y verificar que el mecanismo corrector funciona
+    if (duty_cycle <= 1.0f) {
+      txInterval_ms = random(TX_LAPSE_MS) + 1000; 
+    } else {
       txInterval_ms = TxTime_ms * 100;
     }
-
+    
     transmitting = false;
-    LoRa.receive();
+    
+    // Reactivamos la recepción de mensajes, que se desactiva
+    // en segundo plano mientras se transmite
+    LoRa.receive();   
   }
 }
 
-// -------------------- Envío con ACK y reintentos --------------------
-bool sendMessageWithRetry(uint8_t* payload, uint8_t payloadLength, uint16_t msgCount, uint8_t msgType) {
-  for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      Serial.print("Retry ");
-      Serial.print(attempt);
-      Serial.print("/");
-      Serial.println(MAX_RETRIES - 1);
-      delay(100 * attempt); // backoff exponencial
-    }
-
-    ackReceived = false;
-    
-    while(!LoRa.beginPacket()) {
-      delay(10);
-    }
-    
-    LoRa.write(destination);
-    LoRa.write(localAddress);
-    LoRa.write(msgType);
-    LoRa.write((uint8_t)(msgCount >> 8));
-    LoRa.write((uint8_t)(msgCount & 0xFF));
-    LoRa.write(payloadLength);
-    LoRa.write(payload, (size_t)payloadLength);
-    
-    // CRC simple
-    uint8_t crc = calculateCRC(payload, payloadLength);
-    LoRa.write(crc);
-    
-    LoRa.endPacket();
-    
-    // Esperar ACK
-    uint32_t ackWaitStart = millis();
-    LoRa.receive();
-    
-    while ((millis() - ackWaitStart) < ACK_TIMEOUT_MS) {
-      if (ackReceived) {
-        return true;
-      }
-      delay(10);
-    }
+// --------------------------------------------------------------------
+// Sending message function
+// --------------------------------------------------------------------
+void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCount) 
+{
+  while(!LoRa.beginPacket()) {            // Comenzamos el empaquetado del mensaje
+    delay(10);
   }
+  LoRa.write(destination);                // Añadimos el ID del destinatario
+  LoRa.write(localAddress);               // Añadimos el ID del remitente
+  LoRa.write((uint8_t)(msgCount >> 7));   // Añadimos el Id del mensaje (MSB primero)
+  LoRa.write((uint8_t)(msgCount & 0xFF)); 
+  LoRa.write(msgLength);                  // Añadimos la longitud en bytes del mensaje
+  LoRa.print(outgoing);                   // Añadimos el mensaje/payload
+  LoRa.endPacket(true);                   // Finalizamos el paquete, pero no esperamos a
+                                          // finalice su transmisión
+  msgCount++;                             // Incrementamos el contador de mensajes
+}
+
+// --------------------------------------------------------------------
+// Receiving message function
+// --------------------------------------------------------------------
+void onReceive(int packetSize) 
+{
+  if (packetSize == 0) return;          // Si no hay mensajes, retornamos
+
+  // Leemos los primeros bytes del mensaje
+  char buffer[50];                      // Buffer para almacenar el mensaje
+  int recipient = LoRa.read();          // Dirección del destinatario
+  uint8_t sender = LoRa.read();         // Dirección del remitente
+                                        // msg ID (High Byte first)
+  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 7) | 
+                            (uint16_t)LoRa.read();
   
-  return false; // Falló después de todos los reintentos
-}
-
-// -------------------- Cálculo de CRC simple --------------------
-uint8_t calculateCRC(uint8_t* data, uint8_t length) {
-  uint8_t crc = 0xFF;
-  for (uint8_t i = 0; i < length; i++) {
-    crc ^= data[i];
+  uint8_t incomingLength = LoRa.read(); // Longitud en bytes del mensaje
+  
+  uint8_t receivedBytes = 0;            // Leemos el mensaje byte a byte
+  while (LoRa.available() && (receivedBytes < uint8_t(sizeof(buffer)-1))) {            
+    buffer[receivedBytes++] = (char)LoRa.read();
   }
-  return crc;
-}
+  buffer[receivedBytes] = '\0';         // Terminamos la cadena
 
-// -------------------- onReceive mejorado --------------------
-void onReceive(int packetSize) {
-  if (transmitting && !txDoneFlag) txDoneFlag = true;
-  if (packetSize == 0) return;
-
-  uint8_t buffer[64];
-  int recipient = LoRa.read();
-  uint8_t sender = LoRa.read();
-  uint8_t msgType = LoRa.read();
-  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 8) | (uint16_t)LoRa.read();
-  uint8_t incomingLength = LoRa.read();
-
-  uint8_t receivedBytes = 0;
-  while (LoRa.available() && (receivedBytes < sizeof(buffer))) {
-    buffer[receivedBytes++] = (uint8_t)LoRa.read();
+  if (incomingLength != receivedBytes) {// Verificamos la longitud del mensaje
+    Serial.print("Receiving error: declared message length " + String(incomingLength));
+    Serial.println(" does not match length " + String(receivedBytes));
+    return;                             
   }
 
-  // Verificar destinatario
-  if ((recipient != localAddress) && (recipient != 0xFF)) {
-    Serial.println("✗ Message not for me");
+  // Verificamos si se trata de un mensaje en broadcast o es un mensaje
+  // dirigido específicamente a este dispositivo.
+  // Nótese que este mecanismo es complementario al uso de la misma
+  // SyncWord y solo tiene sentido si hay más de dos receptores activos
+  // compartiendo la misma palabra de sincronización
+  if ((recipient & localAddress) != localAddress ) {
+    Serial.println("Receiving error: This message is not for me.");
     return;
   }
 
-  // Verificar CRC si hay datos
-  if (receivedBytes > 0) {
-    uint8_t receivedCRC = buffer[receivedBytes - 1];
-    uint8_t calculatedCRC = calculateCRC(buffer, receivedBytes - 1);
-    
-    if (receivedCRC != calculatedCRC) {
-      Serial.println("✗ CRC mismatch! Corrupted packet.");
-      return;
-    }
-    receivedBytes--; // quitar CRC del payload
-  }
-
-  // Actualizar RSSI y SNR
-  remoteRSSI = LoRa.packetRssi();
-  remoteSNR  = LoRa.packetSnr();
-
-  // Procesar según tipo de mensaje
-  if (msgType == MSG_ACK) {
-    ackReceived = true;
-    Serial.println("✓ ACK received");
-    return;
-  }
-
-  Serial.println("\n--- Received ---");
-  Serial.print("From: 0x");
-  Serial.print(sender, HEX);
-  Serial.print(" | Type: ");
-  Serial.print(msgType);
-  Serial.print(" | ID: ");
-  Serial.print(incomingMsgId);
-  Serial.print(" | RSSI: ");
-  Serial.print(remoteRSSI);
-  Serial.print(" dBm | SNR: ");
-  Serial.print(remoteSNR, 1);
-  Serial.println(" dB");
-
-  // Enviar ACK
-  sendACK(sender, incomingMsgId);
-
-  // Procesar datos estándar de configuración
-  if (receivedBytes == 4 && msgType == MSG_DATA) {
-    remoteNodeConf.bandwidth_index = buffer[0] >> 4;
-    remoteNodeConf.spreadingFactor = 6 + ((buffer[0] & 0x0F) >> 1);
-    remoteNodeConf.codingRate = 5 + (buffer[1] >> 6);
-    remoteNodeConf.txPower = 2 + ((buffer[1] & 0x3F) >> 1);
-    
-    Serial.print("Remote: BW=");
-    Serial.print(bandwidth_kHz[remoteNodeConf.bandwidth_index]);
-    Serial.print(" kHz, SF=");
-    Serial.print(remoteNodeConf.spreadingFactor);
-    Serial.print(", CR=");
-    Serial.print(remoteNodeConf.codingRate);
-    Serial.print(", Pwr=");
-    Serial.print(remoteNodeConf.txPower);
-    Serial.println(" dBm");
-  }
+  // Imprimimos los detalles del mensaje recibido
+  Serial.println("Received from: 0x" + String(sender, HEX));
+  Serial.println("Sent to: 0x" + String(recipient, HEX));
+  Serial.println("Message ID: " + String(incomingMsgId));
+  Serial.println("Message length: " + String(incomingLength));
+  Serial.println("Message: " + String(buffer));
+  Serial.print("RSSI: " + String(LoRa.packetRssi()));
+  Serial.println(" dBm\nSNR: " + String(LoRa.packetSnr()));
+  Serial.println();
 }
 
-// -------------------- Enviar ACK --------------------
-void sendACK(uint8_t recipient, uint16_t msgId) {
-  LoRa.beginPacket();
-  LoRa.write(recipient);
-  LoRa.write(localAddress);
-  LoRa.write(MSG_ACK);
-  LoRa.write((uint8_t)(msgId >> 8));
-  LoRa.write((uint8_t)(msgId & 0xFF));
-  LoRa.write(0); // sin payload
-  LoRa.endPacket();
-}
-
-void TxFinished() {
+void TxFinished()
+{
   txDoneFlag = true;
-}
-
-void printBinaryPayload(uint8_t * payload, uint8_t payloadLength) {
-  for (int i = 0; i < payloadLength; i++) {
-    Serial.print((payload[i] & 0xF0) >> 4, HEX);
-    Serial.print(payload[i] & 0x0F, HEX);
-    Serial.print(" ");
-  }
-}
-
-// -------------------- AutoAdjust MEJORADO --------------------
-void autoAdjustConfigImproved() {
-  const float MIN_SNR  = -12.0;
-  const int   MIN_RSSI = -118;
-
-  Serial.println("\n╔═══════════════════════════════════════════════════╗");
-  Serial.println("║  AUTO-ADJUST MEJORADO - Exploración Exhaustiva   ║");
-  Serial.println("╚═══════════════════════════════════════════════════╝\n");
-
-  struct Result {
-    uint8_t sf;
-    uint8_t bw;
-    uint8_t cr;
-    uint32_t txTime;
-    float snr;
-    int rssi;
-    float reliability; // % éxito en reintentos
-    bool valid;
-  };
-
-  Result best = {0, 0, 0, 0xFFFFFFFF, -200.0, -200, 0.0, false};
-  int totalTests = 0;
-  int validTests = 0;
-
-  uint8_t testPayload[4] = {0xAA, 0x55, 0, 0};
-
-  // EXPLORACIÓN EXHAUSTIVA: BW, SF y CR
-  for (int bw = 9; bw >= 6; bw--) {        // 500→125→62.5→41.7 kHz
-    for (int sf = 7; sf <= 12; sf++) {     // SF7→SF12
-      for (int cr = 5; cr <= 8; cr++) {    // CR 4/5 → 4/8
-        
-        totalTests++;
-        
-        Serial.print("\n[Test ");
-        Serial.print(totalTests);
-        Serial.print("] SF=");
-        Serial.print(sf);
-        Serial.print(" BW=");
-        Serial.print((int)bandwidth_kHz[bw]);
-        Serial.print(" kHz CR=4/");
-        Serial.println(cr);
-
-        // Configurar y dar tiempo de estabilización
-        LoRa.setSpreadingFactor(sf);
-        LoRa.setSignalBandwidth((long)bandwidth_kHz[bw]);
-        LoRa.setCodingRate4(cr);
-        delay(10);
-
-        // Múltiples intentos para calcular fiabilidad
-        int successes = 0;
-        float sumSNR = 0;
-        int sumRSSI = 0;
-        uint32_t sumTime = 0;
-
-        for (int trial = 0; trial < CALIBRATION_RETRIES; trial++) {
-          remoteSNR  = -200.0;
-          remoteRSSI = -200;
-
-          testPayload[2] = sf;
-          testPayload[3] = bw;
-
-          uint32_t t0 = millis();
-          LoRa.beginPacket();
-          LoRa.write(destination);
-          LoRa.write(localAddress);
-          LoRa.write(MSG_CALIBRATION);
-          LoRa.write(0);
-          LoRa.write(0);
-          LoRa.write(4);
-          LoRa.write(testPayload, 4);
-          LoRa.write(calculateCRC(testPayload, 4));
-          LoRa.endPacket();
-          
-          LoRa.receive();
-          delay(400);
-
-          uint32_t txTime = millis() - t0;
-
-          if (remoteSNR > -150 && remoteSNR >= MIN_SNR && remoteRSSI >= MIN_RSSI) {
-            successes++;
-            sumSNR += remoteSNR;
-            sumRSSI += remoteRSSI;
-            sumTime += txTime;
-          }
-          
-          delay(50);
-        }
-
-        float reliability = (100.0 * successes) / CALIBRATION_RETRIES;
-        
-        Serial.print("  → Fiabilidad: ");
-        Serial.print(reliability, 0);
-        Serial.println("%");
-
-        if (successes == 0) {
-          Serial.println("  → ✗ Config fallida (0% éxito)");
-          continue;
-        }
-
-        float avgSNR = sumSNR / successes;
-        int avgRSSI = sumRSSI / successes;
-        uint32_t avgTime = sumTime / successes;
-
-        Serial.print("  → SNR: ");
-        Serial.print(avgSNR, 1);
-        Serial.print(" dB | RSSI: ");
-        Serial.print(avgRSSI);
-        Serial.print(" dBm | Tiempo: ");
-        Serial.print(avgTime);
-        Serial.println(" ms");
-
-        // Criterio de selección: tiempo más bajo con 100% fiabilidad
-        if (reliability >= 100.0 && avgTime < best.txTime) {
-          best.sf = sf;
-          best.bw = bw;
-          best.cr = cr;
-          best.txTime = avgTime;
-          best.snr = avgSNR;
-          best.rssi = avgRSSI;
-          best.reliability = reliability;
-          best.valid = true;
-          validTests++;
-
-          Serial.println("  → ✓ ¡NUEVA MEJOR CONFIG!");
-        } else if (reliability >= 100.0) {
-          validTests++;
-        }
-      }
-    }
-  }
-
-  Serial.println("\n╔═══════════════════════════════════════════════════╗");
-  Serial.println("║            RESULTADOS DE CALIBRACIÓN             ║");
-  Serial.println("╚═══════════════════════════════════════════════════╝");
-  Serial.print("Tests totales: ");
-  Serial.println(totalTests);
-  Serial.print("Configs válidas: ");
-  Serial.println(validTests);
-
-  if (!best.valid) {
-    Serial.println("\n⚠ ERROR: No se encontró configuración válida.");
-    Serial.println("Manteniendo config por defecto.\n");
-    configSyncDone = true;
-    return;
-  }
-
-  // Aplicar configuración óptima
-  thisNodeConf.spreadingFactor = best.sf;
-  thisNodeConf.bandwidth_index = best.bw;
-  thisNodeConf.codingRate = best.cr;
-
-  LoRa.setSpreadingFactor(best.sf);
-  LoRa.setSignalBandwidth((long)bandwidth_kHz[best.bw]);
-  LoRa.setCodingRate4(best.cr);
-  delay(10);
-
-  // Notificar configuración final al esclavo
-  uint8_t finalPayload[3] = {best.sf, best.bw, best.cr};
-  sendMessageWithRetry(finalPayload, 3, 999, MSG_CONFIG_FINAL);
-
-  Serial.println("\n╔═══════════════════════════════════════════════════╗");
-  Serial.println("║          CONFIGURACIÓN ÓPTIMA APLICADA           ║");
-  Serial.println("╠═══════════════════════════════════════════════════╣");
-  Serial.print("║  SF: ");
-  Serial.print(best.sf);
-  Serial.println("                                           ║");
-  Serial.print("║  BW: ");
-  Serial.print((int)bandwidth_kHz[best.bw]);
-  Serial.println(" kHz                                  ║");
-  Serial.print("║  CR: 4/");
-  Serial.print(best.cr);
-  Serial.println("                                         ║");
-  Serial.print("║  Tiempo TX: ");
-  Serial.print(best.txTime);
-  Serial.println(" ms                              ║");
-  Serial.print("║  SNR: ");
-  Serial.print(best.snr, 1);
-  Serial.println(" dB                                  ║");
-  Serial.print("║  RSSI: ");
-  Serial.print(best.rssi);
-  Serial.println(" dBm                                ║");
-  Serial.print("║  Fiabilidad: ");
-  Serial.print(best.reliability, 0);
-  Serial.println("%                              ║");
-  Serial.println("╚═══════════════════════════════════════════════════╝\n");
-
-  configSyncDone = true;
 }

@@ -1,515 +1,239 @@
 /* ---------------------------------------------------------------------
- *  Esclavo LoRa con SINCRONIZACIÓN INICIAL ROBUSTA
+ *  Ejemplo MKR1310_LoRa_SendReceive_WithCallbacks
+ *  Práctica 3
+ *  Asignatura (GII-IoT)
+ *  
+ *  Basado en el ejemplo MKR1310_LoRa_SendReceive_WithReceiveCallback,
+ *  muestra cómo es posible resolver la transmisión  
+ *  y recepción de mensajes de forma asíncrona.
+ *  Adicionalmente, monitorea el duty-cycle e intenta
+ *  ajustar el intervalo entre la transmisión de paquetes
+ *  para mantener el duty cycle por debajo del 1%.
+ *  
+ *  
+ *  Este ejemplo requiere de una versión modificada
+ *  de la librería Arduino LoRa (descargable desde 
+ *  CV de la asignatura.
+ *  
+ *  También usa la librería Arduino_BQ24195 
+ *  https://github.com/arduino-libraries/Arduino_BQ24195
  * ---------------------------------------------------------------------
  */
 
-#include <SPI.h>
+#include <SPI.h>             
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
-const uint8_t localAddress = 0x05;
-uint8_t masterAddress = 0x06;
+#define TX_LAPSE_MS          10000
 
-volatile bool transmitting = false;
-volatile bool txDoneFlag = true;
+// NOTA: Ajustar estas variables 
+const uint8_t localAddress = 0x48;     // Dirección de este dispositivo
+uint8_t destination = 0xFF;            // Dirección de destino, 0xFF es la dirección de broadcast
 
-// Tipos de mensaje
-enum MessageType {
-  MSG_SYNC = 0x00,
-  MSG_CALIBRATION = 0x01,
-  MSG_CONFIG_FINAL = 0x02,
-  MSG_DATA = 0x03,
-  MSG_ACK = 0x04
-};
+volatile bool txDoneFlag = true;       // Flag para indicar cuando ha finalizado una transmisión
 
-typedef struct {
-  uint8_t bandwidth_index;
-  uint8_t spreadingFactor;
-  uint8_t codingRate;
-  uint8_t txPower;
-} LoRaConfig_t;
+// --------------------------------------------------------------------
+// Setup function
+// --------------------------------------------------------------------
+void setup() 
+{
+  Serial.begin(9600);  
+  while (!Serial); 
 
-double bandwidth_kHz[10] = {7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3,
-                            41.7E3, 62.5E3, 125E3, 250E3, 500E3};
+  Serial.println("LoRa Duplex with TxDone and Receive callbacks");
 
-// CONFIGURACIÓN INICIAL COMÚN (debe coincidir con el maestro)
-LoRaConfig_t thisNodeConf = {7, 10, 5, 14}; // BW=125kHz, SF=10, CR=4/5, Pwr=14dBm
+  // Es posible indicar los pines para CS, reset e IRQ pins (opcional)
+  // LoRa.setPins(csPin, resetPin, irqPin);// set CS, reset, IRQ pin
 
-bool syncedWithMaster = false;
-
-struct Stats {
-  uint32_t packetsReceived;
-  uint32_t packetsSent;
-  uint32_t crcErrors;
-  uint32_t calibrationRequests;
-  uint32_t syncAttempts;
-} stats = {0, 0, 0, 0, 0};
-
-void setup() {
-  Serial.begin(115200);
-  while(!Serial) delay(10);
   
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
-  
-  Serial.println("\n╔═══════════════════════════════════════════════════╗");
-  Serial.println("║    LoRa SLAVE con Sincronización Robusta         ║");
-  Serial.println("╚═══════════════════════════════════════════════════╝\n");
-
   if (!init_PMIC()) {
-    Serial.println("⚠ Init PMIC failed (or not present)");
+    Serial.println("Initilization of BQ24195L failed!");
+  }
+  else {
+    Serial.println("Initilization of BQ24195L succeeded!");
   }
 
-  if (!LoRa.begin(868E6)) {
-    Serial.println("✗ LoRa init failed. Check wiring.");
-    while (true) {
-      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-      delay(200);
-    }
+  if (!LoRa.begin(868E6)) {      // Initicializa LoRa a 868 MHz
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true);                
   }
 
-  LoRa.setSignalBandwidth(long(bandwidth_kHz[thisNodeConf.bandwidth_index]));
-  LoRa.setSpreadingFactor(thisNodeConf.spreadingFactor);
-  LoRa.setCodingRate4(thisNodeConf.codingRate);
-  LoRa.setTxPower(thisNodeConf.txPower, PA_OUTPUT_PA_BOOST_PIN);
-  LoRa.setSyncWord(0x12);
-  LoRa.setPreambleLength(8);
+  // Configuramos algunos parámetros de la radio
+  LoRa.setSignalBandwidth(125E3); // 7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3
+                                  // 41.7E3, 62.5E3, 125E3, 250E3, 500E3 
+                                  // Multiplicar por dos el ancho de banda
+                                  // supone dividir a la mitad el tiempo de Tx
+  LoRa.setSpreadingFactor(12);     // [6, 12] Aumentar el spreading factor incrementa 
+  // original 7, nosotros 12
+  /*
+    //12
+    Sending 'Message no. 000 from 0xBB' ----> TX completed in 1652 msecs
+    Duty cycle: 16.5 %
 
+    Received from: 0x13
+    Sent to: 0xff
+    Message ID: 2
+    Message length: 15
+    Message: Roberto trabaja
+    RSSI: -85 dBm
+    SNR: 8.00
+  */
+                                  // de forma significativa el tiempo de Tx
+                                  // SPF = 6 es un valor especial
+                                  // Ver tabla 12 del manual del SEMTECH SX1276
+  LoRa.setSyncWord(0x12);         // Palabra de sincronización privada por defecto para SX127X 
+                                  // Usaremos la palabra de sincronización para crear diferentes
+                                  // redes privadas por equipos
+  LoRa.setCodingRate4(5);         // [5, 8] 5 da un tiempo de Tx menor
+  LoRa.setPreambleLength(8);      // Número de símbolos a usar como preámbulo
+
+  LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN); // Rango [2, 20] en dBm
+                                  // Importante seleccionar un valor bajo para pruebas
+                                  // a corta distancia y evitar saturar al receptor
+
+  // Indicamos el callback para cuando se reciba un paquete
   LoRa.onReceive(onReceive);
-  LoRa.onTxDone(onTxDone);
+  
+  // Nótese que la recepción está activada a partir de este punto
   LoRa.receive();
 
-  Serial.println("✓ LoRa slave initialized");
-  Serial.print("Address: 0x");
-  Serial.println(localAddress, HEX);
-  Serial.print("Initial config: BW=");
-  Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
-  Serial.print(" kHz, SF=");
-  Serial.print(thisNodeConf.spreadingFactor);
-  Serial.print(", CR=4/");
-  Serial.print(thisNodeConf.codingRate);
-  Serial.print(", Power=");
-  Serial.print(thisNodeConf.txPower);
-  Serial.println(" dBm");
-  
-  Serial.println("\n╔═══════════════════════════════════════════════════╗");
-  Serial.println("║          ESPERANDO SINCRONIZACIÓN...              ║");
-  Serial.println("╚═══════════════════════════════════════════════════╝\n");
-  Serial.println("→ Escaneando configuraciones comunes...");
+  // Activamos el callback que nos indicará cuando ha finalizado la 
+  // transmisión de un mensaje
+  LoRa.onTxDone(TxFinished);
+
+  Serial.println("LoRa init succeeded.");
 }
 
-void loop() {
-  static uint32_t lastStatsTime = 0;
-  static uint32_t lastConfigSwitch = 0;
-  static int currentConfigIndex = 0;
+// --------------------------------------------------------------------
+// Loop function
+// --------------------------------------------------------------------
+void loop() 
+{
+  static uint32_t lastSendTime_ms = 0;
+  static uint16_t msgCount = 0;
+  static uint32_t txInterval_ms = TX_LAPSE_MS;
+  static uint32_t tx_begin_ms = 0;
+  static bool transmitting = false;
   
-  // Si no está sincronizado, rotar entre configuraciones comunes
-  if (!syncedWithMaster) {
-    if (millis() - lastConfigSwitch > 3000) { // Cambiar cada 3 segundos
-      struct SyncConfig {
-        uint8_t bw;
-        uint8_t sf;
-      };
-      
-      SyncConfig commonConfigs[] = {
-        {7, 10},  // 125kHz, SF10
-        {7, 9},   // 125kHz, SF9
-        {7, 11},  // 125kHz, SF11
-        {7, 12},  // 125kHz, SF12
-        {8, 10},  // 250kHz, SF10
-      };
-      
-      int numConfigs = sizeof(commonConfigs) / sizeof(SyncConfig);
-      
-      currentConfigIndex = (currentConfigIndex + 1) % numConfigs;
-      
-      thisNodeConf.bandwidth_index = commonConfigs[currentConfigIndex].bw;
-      thisNodeConf.spreadingFactor = commonConfigs[currentConfigIndex].sf;
-      
-      LoRa.setSpreadingFactor(thisNodeConf.spreadingFactor);
-      LoRa.setSignalBandwidth((long)bandwidth_kHz[thisNodeConf.bandwidth_index]);
-      delay(10);
-      LoRa.receive();
-      
-      Serial.print("→ Escaneando: BW=");
-      Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
-      Serial.print(" kHz, SF=");
-      Serial.print(thisNodeConf.spreadingFactor);
-      Serial.println(" (esperando maestro...)");
-      
-      lastConfigSwitch = millis();
-      stats.syncAttempts++;
-      
-      // Parpadeo lento mientras busca
-      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-    }
-  } else {
-    // Ya sincronizado - LED fijo
-    digitalWrite(LED_BUILTIN, HIGH);
+  if (!transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
+
+    char message[50];
+
+    snprintf(message, sizeof(message),"Message no. %03d from 0x%02X", 
+             msgCount, localAddress);
+
+    transmitting = true;
+    txDoneFlag = false;
+    tx_begin_ms = millis();
+  
+    sendMessage(message, uint8_t(strlen(message)), msgCount);
+    Serial.print("Sending '");
+    Serial.print(message);
+    Serial.print("' ");
+  }                  
+  
+  if (transmitting && txDoneFlag) {
+    uint32_t TxTime_ms = millis() - tx_begin_ms;
+    Serial.print("----> TX completed in ");
+    Serial.print(TxTime_ms);
+    Serial.println(" msecs");
     
-    // Mostrar estadísticas cada 30 segundos
-    if (millis() - lastStatsTime > 30000) {
-      printStats();
-      lastStatsTime = millis();
+    // Ajustamos txInterval_ms para respetar un duty cycle del 1% 
+    uint32_t lapse_ms = tx_begin_ms - lastSendTime_ms;
+    lastSendTime_ms = tx_begin_ms; 
+    float duty_cycle = (100.0f * TxTime_ms) / lapse_ms;
+    
+    Serial.print("Duty cycle: ");
+    Serial.print(duty_cycle,1);
+    Serial.println(" %\n");
+
+    // Solo si el ciclo de trabajo es superior al 1% lo ajustamos
+    // Dejamos random() solo para introducir cierta variabilidad
+    // y verificar que el mecanismo corrector funciona
+    if (duty_cycle <= 1.0f) {
+      txInterval_ms = random(TX_LAPSE_MS) + 1000; 
+    } else {
+      txInterval_ms = TxTime_ms * 100;
     }
+    
+    transmitting = false;
+    
+    // Reactivamos la recepción de mensajes, que se desactiva
+    // en segundo plano mientras se transmite
+    LoRa.receive();   
   }
-  
-  delay(100);
 }
 
-uint8_t calculateCRC(uint8_t* data, uint8_t length) {
-  uint8_t crc = 0xFF;
-  for (uint8_t i = 0; i < length; i++) {
-    crc ^= data[i];
+// --------------------------------------------------------------------
+// Sending message function
+// --------------------------------------------------------------------
+void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCount) 
+{
+  while(!LoRa.beginPacket()) {            // Comenzamos el empaquetado del mensaje
+    delay(10);
   }
-  return crc;
+  LoRa.write(destination);                // Añadimos el ID del destinatario
+  LoRa.write(localAddress);               // Añadimos el ID del remitente
+  LoRa.write((uint8_t)(msgCount >> 7));   // Añadimos el Id del mensaje (MSB primero)
+  LoRa.write((uint8_t)(msgCount & 0xFF)); 
+  LoRa.write(msgLength);                  // Añadimos la longitud en bytes del mensaje
+  LoRa.print(outgoing);                   // Añadimos el mensaje/payload
+  LoRa.endPacket(true);                   // Finalizamos el paquete, pero no esperamos a
+                                          // finalice su transmisión
+  msgCount++;                             // Incrementamos el contador de mensajes
 }
 
-void sendACK(uint8_t recipient, uint16_t msgId) {
-  LoRa.beginPacket();
-  LoRa.write(recipient);
-  LoRa.write(localAddress);
-  LoRa.write(MSG_ACK);
-  LoRa.write((uint8_t)(msgId >> 8));
-  LoRa.write((uint8_t)(msgId & 0xFF));
-  LoRa.write(0);
-  LoRa.endPacket();
-  
-  stats.packetsSent++;
-}
+// --------------------------------------------------------------------
+// Receiving message function
+// --------------------------------------------------------------------
+void onReceive(int packetSize) 
+{
+  if (packetSize == 0) return;          // Si no hay mensajes, retornamos
 
-void sendCalibrationResponse(uint8_t recipient, int rssi, float snr) {
-  uint8_t reply[4];
+  // Leemos los primeros bytes del mensaje
+  char buffer[50];                      // Buffer para almacenar el mensaje
+  int recipient = LoRa.read();          // Dirección del destinatario
+  uint8_t sender = LoRa.read();         // Dirección del remitente
+                                        // msg ID (High Byte first)
+  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 7) | 
+                            (uint16_t)LoRa.read();
   
-  reply[0] = (thisNodeConf.bandwidth_index << 4) | ((thisNodeConf.spreadingFactor - 6) << 1);
-  reply[1] = ((thisNodeConf.codingRate - 5) << 6) | ((thisNodeConf.txPower - 2) << 1);
+  uint8_t incomingLength = LoRa.read(); // Longitud en bytes del mensaje
   
-  int16_t encodedRSSI = int16_t(-rssi * 2);
-  if (encodedRSSI < 0) encodedRSSI = 0;
-  if (encodedRSSI > 255) encodedRSSI = 255;
-  reply[2] = (uint8_t)encodedRSSI;
-  
-  int16_t encodedSNR = int16_t(148 + round(snr));
-  if (encodedSNR < 0) encodedSNR = 0;
-  if (encodedSNR > 255) encodedSNR = 255;
-  reply[3] = (uint8_t)encodedSNR;
-  
-  uint8_t crc = calculateCRC(reply, 4);
-  
-  LoRa.beginPacket();
-  LoRa.write(recipient);
-  LoRa.write(localAddress);
-  LoRa.write(MSG_DATA);
-  LoRa.write(0);
-  LoRa.write(0);
-  LoRa.write(4);
-  LoRa.write(reply, 4);
-  LoRa.write(crc);
-  LoRa.endPacket();
-  
-  stats.packetsSent++;
-  
-  Serial.print("→ Calibration response sent (RSSI: ");
-  Serial.print(rssi);
-  Serial.print(" dBm, SNR: ");
-  Serial.print(snr, 1);
-  Serial.println(" dB)");
-}
+  uint8_t receivedBytes = 0;            // Leemos el mensaje byte a byte
+  while (LoRa.available() && (receivedBytes < uint8_t(sizeof(buffer)-1))) {            
+    buffer[receivedBytes++] = (char)LoRa.read();
+  }
+  buffer[receivedBytes] = '\0';         // Terminamos la cadena
 
-bool applyNewConfig(uint8_t sf, uint8_t bw, uint8_t cr) {
-  if (sf < 7 || sf > 12) {
-    Serial.println("✗ Invalid SF");
-    return false;
+  if (incomingLength != receivedBytes) {// Verificamos la longitud del mensaje
+    Serial.print("Receiving error: declared message length " + String(incomingLength));
+    Serial.println(" does not match length " + String(receivedBytes));
+    return;                             
   }
-  if (bw > 9) {
-    Serial.println("✗ Invalid BW index");
-    return false;
-  }
-  if (cr < 5 || cr > 8) {
-    Serial.println("✗ Invalid CR");
-    return false;
-  }
-  
-  Serial.println("\n╔═══════════════════════════════════════════════════╗");
-  Serial.println("║         APPLYING NEW CONFIGURATION               ║");
-  Serial.println("╚═══════════════════════════════════════════════════╝");
-  
-  Serial.print("Previous: SF=");
-  Serial.print(thisNodeConf.spreadingFactor);
-  Serial.print(" BW=");
-  Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
-  Serial.print(" kHz CR=4/");
-  Serial.println(thisNodeConf.codingRate);
-  
-  thisNodeConf.spreadingFactor = sf;
-  thisNodeConf.bandwidth_index = bw;
-  thisNodeConf.codingRate = cr;
-  
-  LoRa.setSpreadingFactor(thisNodeConf.spreadingFactor);
-  LoRa.setSignalBandwidth(long(bandwidth_kHz[thisNodeConf.bandwidth_index]));
-  LoRa.setCodingRate4(thisNodeConf.codingRate);
-  delay(10);
-  
-  Serial.print("New:      SF=");
-  Serial.print(thisNodeConf.spreadingFactor);
-  Serial.print(" BW=");
-  Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
-  Serial.print(" kHz CR=4/");
-  Serial.println(thisNodeConf.codingRate);
-  Serial.println("✓ Configuration applied successfully\n");
-  
-  for (int i = 0; i < 6; i++) {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-    delay(100);
-  }
-  digitalWrite(LED_BUILTIN, HIGH);
-  
-  return true;
-}
 
-void onReceive(int packetSize) {
-  if (packetSize == 0) return;
-  
-  stats.packetsReceived++;
-  
-  uint8_t buffer[64];
-  int recipient = LoRa.read();
-  uint8_t sender = LoRa.read();
-  uint8_t msgType = LoRa.read();
-  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 8) | (uint16_t)LoRa.read();
-  uint8_t incomingLength = LoRa.read();
-  
-  uint8_t receivedBytes = 0;
-  while (LoRa.available() && (receivedBytes < sizeof(buffer))) {
-    buffer[receivedBytes++] = (uint8_t)LoRa.read();
-  }
-  
-  if ((recipient != localAddress) && (recipient != 0xFF)) {
+  // Verificamos si se trata de un mensaje en broadcast o es un mensaje
+  // dirigido específicamente a este dispositivo.
+  // Nótese que este mecanismo es complementario al uso de la misma
+  // SyncWord y solo tiene sentido si hay más de dos receptores activos
+  // compartiendo la misma palabra de sincronización
+  if ((recipient & localAddress) != localAddress ) {
+    Serial.println("Receiving error: This message is not for me.");
     return;
   }
-  
-  int rssi = LoRa.packetRssi();
-  float snr = LoRa.packetSnr();
-  
-  if (receivedBytes > 0) {
-    uint8_t receivedCRC = buffer[receivedBytes - 1];
-    uint8_t calculatedCRC = calculateCRC(buffer, receivedBytes - 1);
-    
-    if (receivedCRC != calculatedCRC) {
-      stats.crcErrors++;
-      Serial.println("\n✗ CRC ERROR - Corrupted packet!");
-      return;
-    }
-    receivedBytes--;
-  }
-  
-  // MENSAJE DE SINCRONIZACIÓN
-  if (msgType == MSG_SYNC && !syncedWithMaster) {
-    Serial.println("\n╔═══════════════════════════════════════════════════╗");
-    Serial.println("║        ✓ SINCRONIZADO CON EL MAESTRO!            ║");
-    Serial.println("╚═══════════════════════════════════════════════════╝");
-    
-    Serial.print("Config de sync: BW=");
-    Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
-    Serial.print(" kHz, SF=");
-    Serial.print(thisNodeConf.spreadingFactor);
-    Serial.print(" | RSSI: ");
-    Serial.print(rssi);
-    Serial.print(" dBm, SNR: ");
-    Serial.print(snr, 1);
-    Serial.println(" dB\n");
-    
-    syncedWithMaster = true;
-    digitalWrite(LED_BUILTIN, HIGH);
-    
-    // Responder al maestro
-    uint8_t syncReply[2] = {0xBB, 0xCC};
-    LoRa.beginPacket();
-    LoRa.write(sender);
-    LoRa.write(localAddress);
-    LoRa.write(MSG_DATA);
-    LoRa.write(0);
-    LoRa.write(0);
-    LoRa.write(2);
-    LoRa.write(syncReply, 2);
-    LoRa.write(calculateCRC(syncReply, 2));
-    LoRa.endPacket();
-    
-    LoRa.receive();
-    return;
-  }
-  
-  // Solo procesar otros mensajes si ya está sincronizado
-  if (!syncedWithMaster && msgType != MSG_SYNC) {
-    return;
-  }
-  
-  Serial.println("\n┌─────────────────────────────────────────┐");
-  Serial.print("│ RX from 0x");
-  Serial.print(sender, HEX);
-  Serial.print(" | Type: ");
-  Serial.print(msgType);
-  Serial.print(" | ID: ");
-  Serial.print(incomingMsgId);
-  Serial.println("    │");
-  Serial.print("│ RSSI: ");
-  Serial.print(rssi);
-  Serial.print(" dBm | SNR: ");
-  Serial.print(snr, 1);
-  Serial.println(" dB       │");
-  Serial.println("└─────────────────────────────────────────┘");
-  
-  switch (msgType) {
-    
-    case MSG_CALIBRATION:
-      stats.calibrationRequests++;
-      Serial.println("→ Calibration request received");
-      
-      // Durante calibración, el maestro puede cambiar los parámetros
-      // Adaptarse automáticamente si detectamos que el maestro cambió
-      if (receivedBytes >= 4) {
-        uint8_t testSF = buffer[2];
-        uint8_t testBW = buffer[3];
-        
-        // Si detectamos parámetros diferentes, adaptarnos
-        if (testSF != thisNodeConf.spreadingFactor || 
-            testBW != thisNodeConf.bandwidth_index) {
-          
-          Serial.print("→ Adaptando a config de prueba: SF=");
-          Serial.print(testSF);
-          Serial.print(" BW=");
-          Serial.println(testBW);
-          
-          thisNodeConf.spreadingFactor = testSF;
-          thisNodeConf.bandwidth_index = testBW;
-          
-          LoRa.setSpreadingFactor(testSF);
-          LoRa.setSignalBandwidth((long)bandwidth_kHz[testBW]);
-          delay(10);
-        }
-      }
-      
-      sendCalibrationResponse(sender, rssi, snr);
-      LoRa.receive();
-      break;
-      
-    case MSG_CONFIG_FINAL:
-      Serial.println("→ Final configuration received");
-      
-      if (receivedBytes >= 3) {
-        uint8_t newSF = buffer[0];
-        uint8_t newBW = buffer[1];
-        uint8_t newCR = buffer[2];
-        
-        if (applyNewConfig(newSF, newBW, newCR)) {
-          sendACK(sender, incomingMsgId);
-          LoRa.receive();
-        }
-      } else {
-        Serial.println("✗ Config message too short");
-      }
-      break;
-      
-    case MSG_DATA:
-      Serial.println("→ Data message received");
-      
-      sendACK(sender, incomingMsgId);
-      
-      if (receivedBytes > 0) {
-        Serial.print("Payload (");
-        Serial.print(receivedBytes);
-        Serial.print(" bytes): ");
-        for (int i = 0; i < receivedBytes; i++) {
-          Serial.print("0x");
-          if (buffer[i] < 0x10) Serial.print("0");
-          Serial.print(buffer[i], HEX);
-          Serial.print(" ");
-        }
-        Serial.println();
-        
-        if (receivedBytes == 4) {
-          uint8_t remoteBW = buffer[0] >> 4;
-          uint8_t remoteSF = 6 + ((buffer[0] & 0x0F) >> 1);
-          uint8_t remoteCR = 5 + (buffer[1] >> 6);
-          uint8_t remotePwr = 2 + ((buffer[1] & 0x3F) >> 1);
-          int remoteRSSI = -int(buffer[2]) / 2;
-          float remoteSNR = int(buffer[3]) - 148;
-          
-          Serial.print("Master status: BW=");
-          Serial.print((int)bandwidth_kHz[remoteBW]);
-          Serial.print(" kHz, SF=");
-          Serial.print(remoteSF);
-          Serial.print(", CR=4/");
-          Serial.print(remoteCR);
-          Serial.print(", Pwr=");
-          Serial.print(remotePwr);
-          Serial.print(" dBm, RSSI=");
-          Serial.print(remoteRSSI);
-          Serial.print(" dBm, SNR=");
-          Serial.print(remoteSNR, 1);
-          Serial.println(" dB");
-        }
-      }
-      
-      LoRa.receive();
-      break;
-      
-    case MSG_ACK:
-      Serial.println("→ ACK received");
-      LoRa.receive();
-      break;
-      
-    default:
-      Serial.print("→ Unknown message type: ");
-      Serial.println(msgType);
-      LoRa.receive();
-      break;
-  }
+
+  // Imprimimos los detalles del mensaje recibido
+  Serial.println("Received from: 0x" + String(sender, HEX));
+  Serial.println("Sent to: 0x" + String(recipient, HEX));
+  Serial.println("Message ID: " + String(incomingMsgId));
+  Serial.println("Message length: " + String(incomingLength));
+  Serial.println("Message: " + String(buffer));
+  Serial.print("RSSI: " + String(LoRa.packetRssi()));
+  Serial.println(" dBm\nSNR: " + String(LoRa.packetSnr()));
+  Serial.println();
 }
 
-void onTxDone() {
-  transmitting = false;
+void TxFinished()
+{
   txDoneFlag = true;
-}
-
-void printStats() {
-  Serial.println("\n╔═══════════════════════════════════════════════════╗");
-  Serial.println("║                  STATISTICS                       ║");
-  Serial.println("╠═══════════════════════════════════════════════════╣");
-  
-  if (!syncedWithMaster) {
-    Serial.print("║ Sync attempts:          ");
-    Serial.print(stats.syncAttempts);
-    Serial.println("                         ║");
-    Serial.println("║ Status:                 NOT SYNCED               ║");
-  } else {
-    Serial.println("║ Status:                 SYNCED ✓                 ║");
-    Serial.print("║ Packets received:       ");
-    Serial.print(stats.packetsReceived);
-    Serial.println("                         ║");
-    Serial.print("║ Packets sent:           ");
-    Serial.print(stats.packetsSent);
-    Serial.println("                         ║");
-    Serial.print("║ CRC errors:             ");
-    Serial.print(stats.crcErrors);
-    Serial.println("                         ║");
-    Serial.print("║ Calibration requests:   ");
-    Serial.print(stats.calibrationRequests);
-    Serial.println("                         ║");
-  }
-  
-  Serial.println("╠═══════════════════════════════════════════════════╣");
-  Serial.print("║ Current SF:             ");
-  Serial.print(thisNodeConf.spreadingFactor);
-  Serial.println("                         ║");
-  Serial.print("║ Current BW:             ");
-  Serial.print((int)bandwidth_kHz[thisNodeConf.bandwidth_index]);
-  Serial.println(" kHz                   ║");
-  Serial.print("║ Current CR:             4/");
-  Serial.print(thisNodeConf.codingRate);
-  Serial.println("                       ║");
-  Serial.print("║ Current Power:          ");
-  Serial.print(thisNodeConf.txPower);
-  Serial.println(" dBm                     ║");
-  Serial.println("╚═══════════════════════════════════════════════════╝\n");
 }
