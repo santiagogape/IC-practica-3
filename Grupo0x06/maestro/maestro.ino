@@ -1,197 +1,230 @@
-/* Maestro - Optimización dinámica de parámetros LoRa
-   Basado en tu ejemplo original. */
+/* ---------------------------------------------------------------------
+ *  Ejemplo MKR1310_LoRa_SendReceive_WithCallbacks
+ *  Práctica 3
+ *  Asignatura (GII-IoT)
+ *  
+ *  Basado en el ejemplo MKR1310_LoRa_SendReceive_WithReceiveCallback,
+ *  muestra cómo es posible resolver la transmisión  
+ *  y recepción de mensajes de forma asíncrona.
+ *  Adicionalmente, monitorea el duty-cycle e intenta
+ *  ajustar el intervalo entre la transmisión de paquetes
+ *  para mantener el duty cycle por debajo del 1%.
+ *  
+ *  
+ *  Este ejemplo requiere de una versión modificada
+ *  de la librería Arduino LoRa (descargable desde 
+ *  CV de la asignatura.
+ *  
+ *  También usa la librería Arduino_BQ24195 
+ *  https://github.com/arduino-libraries/Arduino_BQ24195
+ * ---------------------------------------------------------------------
+ */
 
-#include <SPI.h>
+#include <SPI.h>             
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
 #define TX_LAPSE_MS          10000
 
-// Umbrales (ajusta según entorno)
-#define RSSI_MIN   -110
-#define SNR_MIN     2.0
-
 // NOTA: Ajustar estas variables 
-const uint8_t localAddress = 0x06;     // Dirección de este maestro
-uint8_t destination = 0x05;            // Dirección del esclavo
+const uint8_t localAddress = 0x06;     // Dirección de este dispositivo
+uint8_t destination = 0x05;            // Dirección de destino, 0xFF es la dirección de broadcast
 
 volatile bool txDoneFlag = true;       // Flag para indicar cuando ha finalizado una transmisión
 
-// Contadores / estados
-static uint16_t msgCount = 0;
-String lastReceivedMessage = "";
-uint32_t lastReceiveMillis = 0;
-
-// Forward declarations
-void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCountRef);
-void sendControlMessage(const String &msg);
-bool waitForMessageStartsWith(const String &prefix, String &out, uint32_t timeout_ms);
-bool waitForExactMessage(const String &exact, uint32_t timeout_ms);
-String waitForMeasurement(uint32_t timeout_ms);
-void parseMeasurement(const String &msg, int &rssi, float &snr);
-
-// Optimización
-void optimizeLoRaConfig();
-void optimizeSpreadingFactor();
-void optimizeBandwidth();
-void optimizeCodingRate();
-void optimizeTxPower();
-
+// --------------------------------------------------------------------
+// Setup function
+// --------------------------------------------------------------------
 void setup() 
 {
   Serial.begin(9600);  
-  while (!Serial);
+  while (!Serial); 
 
-  Serial.println("MASTER: LoRa Optimizer");
+  Serial.println("LoRa Duplex with TxDone and Receive callbacks");
 
+  // Es posible indicar los pines para CS, reset e IRQ pins (opcional)
+  // LoRa.setPins(csPin, resetPin, irqPin);// set CS, reset, IRQ pin
+
+  
   if (!init_PMIC()) {
     Serial.println("Initilization of BQ24195L failed!");
-  } else {
+  }
+  else {
     Serial.println("Initilization of BQ24195L succeeded!");
   }
 
-  if (!LoRa.begin(868E6)) {
+  if (!LoRa.begin(868E6)) {      // Initicializa LoRa a 868 MHz
     Serial.println("LoRa init failed. Check your connections.");
-    while (true);
+    while (true);                
   }
 
-  // Paràmetros radio iniciales
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setSpreadingFactor(12);
-  LoRa.setSyncWord(0x12);
-  LoRa.setCodingRate4(5);
-  LoRa.setPreambleLength(8);
-  LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN);
+  // Configuramos algunos parámetros de la radio
+  LoRa.setSignalBandwidth(125E3); // 7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3
+                                  // 41.7E3, 62.5E3, 125E3, 250E3, 500E3 
+                                  // Multiplicar por dos el ancho de banda
+                                  // supone dividir a la mitad el tiempo de Tx
+  LoRa.setSpreadingFactor(12);     // [6, 12] Aumentar el spreading factor incrementa 
+  // original 7, nosotros 12
+  /*
+    //12
+    Sending 'Message no. 000 from 0xBB' ----> TX completed in 1652 msecs
+    Duty cycle: 16.5 %
 
+    Received from: 0x13
+    Sent to: 0xff
+    Message ID: 2
+    Message length: 15
+    Message: Roberto trabaja
+    RSSI: -85 dBm
+    SNR: 8.00
+  */
+                                  // de forma significativa el tiempo de Tx
+                                  // SPF = 6 es un valor especial
+                                  // Ver tabla 12 del manual del SEMTECH SX1276
+  LoRa.setSyncWord(0x12);         // Palabra de sincronización privada por defecto para SX127X 
+                                  // Usaremos la palabra de sincronización para crear diferentes
+                                  // redes privadas por equipos
+  LoRa.setCodingRate4(5);         // [5, 8] 5 da un tiempo de Tx menor
+  LoRa.setPreambleLength(8);      // Número de símbolos a usar como preámbulo
+
+  LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN); // Rango [2, 20] en dBm
+                                  // Importante seleccionar un valor bajo para pruebas
+                                  // a corta distancia y evitar saturar al receptor
+
+  // Indicamos el callback para cuando se reciba un paquete
   LoRa.onReceive(onReceive);
+  
+  // Nótese que la recepción está activada a partir de este punto
   LoRa.receive();
+
+  // Activamos el callback que nos indicará cuando ha finalizado la 
+  // transmisión de un mensaje
   LoRa.onTxDone(TxFinished);
 
   Serial.println("LoRa init succeeded.");
-
-  // Pequeña espera para estabilizar
-  delay(500);
 }
 
-static uint32_t lastSendTime_ms = 0;
-static uint32_t txInterval_ms = TX_LAPSE_MS;
-static uint32_t tx_begin_ms = 0;
-static bool transmitting = false;
-
+// --------------------------------------------------------------------
+// Loop function
+// --------------------------------------------------------------------
 void loop() 
 {
-  // Ejecutar la optimización una sola vez al inicio (puedes repetirla si quieres)
-  static bool optimized = false;
-  if (!optimized) {
-    optimizeLoRaConfig();
-    optimized = true;
-  }
-
-  // --- Mantener la transmisión periódica del ejemplo original ---
+  static uint32_t lastSendTime_ms = 0;
+  static uint16_t msgCount = 0;
+  static uint32_t txInterval_ms = TX_LAPSE_MS;
+  static uint32_t tx_begin_ms = 0;
+  static bool transmitting = false;
+  
   if (!transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
+
     char message[50];
-    snprintf(message, sizeof(message),"Message no. %03d from 0x%02X", msgCount, localAddress);
+
+    snprintf(message, sizeof(message),"Message no. %03d from 0x%02X", 
+             msgCount, localAddress);
 
     transmitting = true;
     txDoneFlag = false;
     tx_begin_ms = millis();
-
+  
     sendMessage(message, uint8_t(strlen(message)), msgCount);
     Serial.print("Sending '");
     Serial.print(message);
     Serial.print("' ");
-  }
-
+  }                  
+  
   if (transmitting && txDoneFlag) {
     uint32_t TxTime_ms = millis() - tx_begin_ms;
     Serial.print("----> TX completed in ");
     Serial.print(TxTime_ms);
     Serial.println(" msecs");
-
+    
+    // Ajustamos txInterval_ms para respetar un duty cycle del 1% 
     uint32_t lapse_ms = tx_begin_ms - lastSendTime_ms;
     lastSendTime_ms = tx_begin_ms; 
-    float duty_cycle = (100.0f * TxTime_ms) / (lapse_ms ? lapse_ms : 1);
-
+    float duty_cycle = (100.0f * TxTime_ms) / lapse_ms;
+    
     Serial.print("Duty cycle: ");
     Serial.print(duty_cycle,1);
     Serial.println(" %\n");
 
+    // Solo si el ciclo de trabajo es superior al 1% lo ajustamos
+    // Dejamos random() solo para introducir cierta variabilidad
+    // y verificar que el mecanismo corrector funciona
     if (duty_cycle <= 1.0f) {
       txInterval_ms = random(TX_LAPSE_MS) + 1000; 
     } else {
       txInterval_ms = TxTime_ms * 100;
     }
-
+    
     transmitting = false;
-    LoRa.receive();
+    
+    // Reactivamos la recepción de mensajes, que se desactiva
+    // en segundo plano mientras se transmite
+    LoRa.receive();   
   }
-
-  // Procesar mensajes de control entrantes en background (opcional)
-  // Si el esclavo tarda mucho en responder, la optimización gestionará timeouts.
 }
 
 // --------------------------------------------------------------------
-// Sending message function (tal y como en tu original)
-void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCountRef) 
+// Sending message function
+// --------------------------------------------------------------------
+void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCount) 
 {
-  while(!LoRa.beginPacket()) {
+  while(!LoRa.beginPacket()) {            // Comenzamos el empaquetado del mensaje
     delay(10);
   }
-  LoRa.write(destination);
-  LoRa.write(localAddress);
-  LoRa.write((uint8_t)(msgCountRef >> 7));
-  LoRa.write((uint8_t)(msgCountRef & 0xFF));
-  LoRa.write(msgLength);
-  LoRa.print(outgoing);
-  LoRa.endPacket(true);
-  msgCountRef++;
-}
-
-// Envío de control (usa sendMessage)
-void sendControlMessage(const String &msg) {
-  char buffer[80];
-  msg.toCharArray(buffer, sizeof(buffer));
-  // Usamos msgCount para todos los mensajes
-  sendMessage(buffer, strlen(buffer), msgCount);
-  // Dejamos un pequeño margen para que el receptor procese
-  delay(200);
+  LoRa.write(destination);                // Añadimos el ID del destinatario
+  LoRa.write(localAddress);               // Añadimos el ID del remitente
+  LoRa.write((uint8_t)(msgCount >> 7));   // Añadimos el Id del mensaje (MSB primero)
+  LoRa.write((uint8_t)(msgCount & 0xFF)); 
+  LoRa.write(msgLength);                  // Añadimos la longitud en bytes del mensaje
+  LoRa.print(outgoing);                   // Añadimos el mensaje/payload
+  LoRa.endPacket(true);                   // Finalizamos el paquete, pero no esperamos a
+                                          // finalice su transmisión
+  msgCount++;                             // Incrementamos el contador de mensajes
 }
 
 // --------------------------------------------------------------------
-// Receiving message function (modificado para guardar lastReceivedMessage)
+// Receiving message function
+// --------------------------------------------------------------------
 void onReceive(int packetSize) 
 {
-  if (packetSize == 0) return;
+  if (packetSize == 0) return;          // Si no hay mensajes, retornamos
 
-  char buffer[100];
-  int recipient = LoRa.read();
-  uint8_t sender = LoRa.read();
-  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 7) | (uint16_t)LoRa.read();
-  uint8_t incomingLength = LoRa.read();
-
-  uint8_t receivedBytes = 0;
-  while (LoRa.available() && (receivedBytes < uint8_t(sizeof(buffer)-1))) {
+  // Leemos los primeros bytes del mensaje
+  char buffer[50];                      // Buffer para almacenar el mensaje
+  int recipient = LoRa.read();          // Dirección del destinatario
+  uint8_t sender = LoRa.read();         // Dirección del remitente
+                                        // msg ID (High Byte first)
+  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 7) | 
+                            (uint16_t)LoRa.read();
+  
+  uint8_t incomingLength = LoRa.read(); // Longitud en bytes del mensaje
+  
+  uint8_t receivedBytes = 0;            // Leemos el mensaje byte a byte
+  while (LoRa.available() && (receivedBytes < uint8_t(sizeof(buffer)-1))) {            
     buffer[receivedBytes++] = (char)LoRa.read();
   }
-  buffer[receivedBytes] = '\0';
+  buffer[receivedBytes] = '\0';         // Terminamos la cadena
 
-  if (incomingLength != receivedBytes) {
+  if (incomingLength != receivedBytes) {// Verificamos la longitud del mensaje
     Serial.print("Receiving error: declared message length " + String(incomingLength));
     Serial.println(" does not match length " + String(receivedBytes));
-    return;
+    return;                             
   }
 
+  // Verificamos si se trata de un mensaje en broadcast o es un mensaje
+  // dirigido específicamente a este dispositivo.
+  // Nótese que este mecanismo es complementario al uso de la misma
+  // SyncWord y solo tiene sentido si hay más de dos receptores activos
+  // compartiendo la misma palabra de sincronización
   if ((recipient & localAddress) != localAddress ) {
-    // No es para mí
+    Serial.println("Receiving error: This message is not for me.");
     return;
   }
 
-  // Guardar el último mensaje recibido para que otras rutinas lo consulten
-  lastReceivedMessage = String(buffer);
-  lastReceiveMillis = millis();
-
-  // Imprimimos info en serial (útil para debug)
+  // Imprimimos los detalles del mensaje recibido
   Serial.println("Received from: 0x" + String(sender, HEX));
+  Serial.println("Sent to: 0x" + String(recipient, HEX));
   Serial.println("Message ID: " + String(incomingMsgId));
   Serial.println("Message length: " + String(incomingLength));
   Serial.println("Message: " + String(buffer));
@@ -200,193 +233,7 @@ void onReceive(int packetSize)
   Serial.println();
 }
 
-// Callback Tx finished
-void TxFinished() {
+void TxFinished()
+{
   txDoneFlag = true;
-}
-
-// --------------------------------------------------------------------
-// Funciones de espera y parseo de mensajes
-bool waitForExactMessage(const String &exact, uint32_t timeout_ms) {
-  uint32_t start = millis();
-  while (millis() - start < timeout_ms) {
-    if (lastReceivedMessage == exact) return true;
-    // Optionally yield
-  }
-  return false;
-}
-
-bool waitForMessageStartsWith(const String &prefix, String &out, uint32_t timeout_ms) {
-  uint32_t start = millis();
-  while (millis() - start < timeout_ms) {
-    if (lastReceivedMessage.length() > 0 && lastReceivedMessage.startsWith(prefix)) {
-      out = lastReceivedMessage;
-      return true;
-    }
-  }
-  return false;
-}
-
-String waitForMeasurement(uint32_t timeout_ms) {
-  String out;
-  if (waitForMessageStartsWith("MEASURE:", out, timeout_ms)) {
-    return out;
-  }
-  return String("MEASURE:0,0");
-}
-
-void parseMeasurement(const String &msg, int &rssi, float &snr) {
-  int p1 = msg.indexOf(':');
-  int p2 = msg.indexOf(',');
-  if (p1 < 0 || p2 < 0) {
-    rssi = 0; snr = 0.0;
-    return;
-  }
-  rssi = msg.substring(p1+1, p2).toInt();
-  snr = msg.substring(p2+1).toFloat();
-}
-
-// --------------------------------------------------------------------
-// Rutinas de optimización (un ejemplo – ajusta orden/estrategia si quieres)
-void optimizeLoRaConfig() {
-  Serial.println("\n[MASTER] ==== Iniciando optimización LoRa ====");
-  optimizeSpreadingFactor();
-  optimizeBandwidth();
-  optimizeCodingRate();
-  optimizeTxPower();
-  Serial.println("[MASTER] ==== Optimización finalizada ====\n");
-}
-
-// Optimiza SF disminuyendo (12 -> 7) intentando mantener RSSI/SNR
-void optimizeSpreadingFactor() {
-  Serial.println("[MASTER] Optimizando Spreading Factor...");
-  for (int sf = 12; sf >= 7; sf--) {
-    Serial.println("[MASTER] Proponiendo SF " + String(sf));
-
-    // 1) Indicar petición
-    sendControlMessage("REQ_PARAM");
-    if (!waitForExactMessage("ACK_PARAM", 2000)) {
-      Serial.println("[MASTER] ERROR: No ACK_PARAM");
-      continue;
-    }
-
-    // 2) Indicar nuevo parámetro
-    sendControlMessage(String("PARAM_SET:SF=") + String(sf));
-    if (!waitForExactMessage("PARAM_APPLIED", 2000)) {
-      Serial.println("[MASTER] ERROR: No PARAM_APPLIED");
-      continue;
-    }
-
-    // 3) Pedir medición
-    sendControlMessage("MEASURE_REQ");
-    String meas = waitForMeasurement(2000);
-    int rssi;
-    float snr;
-    parseMeasurement(meas, rssi, snr);
-
-    Serial.println("[MASTER] Resultado SF=" + String(sf) + " RSSI=" + String(rssi) + " SNR=" + String(snr));
-
-    if (rssi < RSSI_MIN || snr < SNR_MIN) {
-      Serial.println("[MASTER] Calidad insuficiente para SF " + String(sf) + ". Revertir a SF " + String(sf+1));
-      LoRa.setSpreadingFactor(sf+1); // revertir en maestro
-      // Notificar al esclavo para que vuelva atrás
-      sendControlMessage("REQ_PARAM");
-      waitForExactMessage("ACK_PARAM", 1000);
-      sendControlMessage(String("PARAM_SET:SF=") + String(sf+1));
-      waitForExactMessage("PARAM_APPLIED", 1000);
-      return;
-    }
-
-    // Si OK, aplicar en maestro (ya debería haberse aplicado por la orden)
-    LoRa.setSpreadingFactor(sf);
-    // seguir probando siguiente SF más pequeño (más rápido)
-  }
-}
-
-// Optimizar Bandwidth: intentar 250k y luego 500k (si hw lo permite)
-void optimizeBandwidth() {
-  Serial.println("[MASTER] Optimizando Bandwidth...");
-  long bws[] = {250000L, 500000L};
-  for (int i = 0; i < 2; i++) {
-    long bw = bws[i];
-    Serial.println("[MASTER] Proponiendo BW " + String(bw));
-    sendControlMessage("REQ_PARAM");
-    if (!waitForExactMessage("ACK_PARAM", 2000)) continue;
-    sendControlMessage(String("PARAM_SET:BW=") + String(bw));
-    if (!waitForExactMessage("PARAM_APPLIED", 2000)) continue;
-    sendControlMessage("MEASURE_REQ");
-    String meas = waitForMeasurement(2000);
-    int rssi; float snr;
-    parseMeasurement(meas, rssi, snr);
-    Serial.println("[MASTER] Resultado BW=" + String(bw) + " RSSI=" + String(rssi) + " SNR=" + String(snr));
-    if (rssi < RSSI_MIN || snr < SNR_MIN) {
-      // revertir a 125k
-      LoRa.setSignalBandwidth(125E3);
-      sendControlMessage("REQ_PARAM");
-      waitForExactMessage("ACK_PARAM", 1000);
-      sendControlMessage(String("PARAM_SET:BW=") + String(125000L));
-      waitForExactMessage("PARAM_APPLIED", 1000);
-      return;
-    }
-    LoRa.setSignalBandwidth((double)bw);
-  }
-}
-
-// Optimizar coding rate: intentar 4/5 (codingRate4 = 5 -> 4/5)
-void optimizeCodingRate() {
-  Serial.println("[MASTER] Optimizando Coding Rate...");
-  int crCandidates[] = {5, 6, 7, 8}; // 4/5 .. 4/8 (5 es menos redundancia)
-  for (int i = 0; i < 4; i++) {
-    int cr = crCandidates[i];
-    Serial.println("[MASTER] Proponiendo CR " + String(cr));
-    sendControlMessage("REQ_PARAM");
-    if (!waitForExactMessage("ACK_PARAM", 2000)) continue;
-    sendControlMessage(String("PARAM_SET:CR=") + String(cr));
-    if (!waitForExactMessage("PARAM_APPLIED", 2000)) continue;
-    sendControlMessage("MEASURE_REQ");
-    String meas = waitForMeasurement(2000);
-    int rssi; float snr;
-    parseMeasurement(meas, rssi, snr);
-    Serial.println("[MASTER] Resultado CR=" + String(cr) + " RSSI=" + String(rssi) + " SNR=" + String(snr));
-    if (rssi < RSSI_MIN || snr < SNR_MIN) {
-      // reponer al valor anterior (que asumimos era 5)
-      LoRa.setCodingRate4(5);
-      sendControlMessage("REQ_PARAM");
-      waitForExactMessage("ACK_PARAM", 1000);
-      sendControlMessage(String("PARAM_SET:CR=") + String(5));
-      waitForExactMessage("PARAM_APPLIED", 1000);
-      return;
-    }
-    LoRa.setCodingRate4(cr);
-  }
-}
-
-// Optimizar potencia Tx: bajar si sigue OK
-void optimizeTxPower() {
-  Serial.println("[MASTER] Optimizando Tx Power...");
-  for (int p = 3; p <= 14; p++) { // probar subidas si quieres, aquí intentamos mantener baja potencia mínima 3
-    Serial.println("[MASTER] Proponiendo POWER " + String(p));
-    sendControlMessage("REQ_PARAM");
-    if (!waitForExactMessage("ACK_PARAM", 2000)) continue;
-    sendControlMessage(String("PARAM_SET:POWER=") + String(p));
-    if (!waitForExactMessage("PARAM_APPLIED", 2000)) continue;
-    sendControlMessage("MEASURE_REQ");
-    String meas = waitForMeasurement(2000);
-    int rssi; float snr;
-    parseMeasurement(meas, rssi, snr);
-    Serial.println("[MASTER] Resultado POWER=" + String(p) + " RSSI=" + String(rssi) + " SNR=" + String(snr));
-    if (rssi < RSSI_MIN || snr < SNR_MIN) {
-      // revertir al valor anterior p-1
-      int prev = max(3, p-1);
-      LoRa.setTxPower(prev, PA_OUTPUT_PA_BOOST_PIN);
-      sendControlMessage("REQ_PARAM");
-      waitForExactMessage("ACK_PARAM", 1000);
-      sendControlMessage(String("PARAM_SET:POWER=") + String(prev));
-      waitForExactMessage("PARAM_APPLIED", 1000);
-      return;
-    }
-    LoRa.setTxPower(p, PA_OUTPUT_PA_BOOST_PIN);
-    // si el objetivo es reducir potencia, en lugar de incrementar
-    // empezaría por p = alto -> bajo; aquí queda como ejemplo.
-  }
 }
