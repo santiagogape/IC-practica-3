@@ -31,6 +31,7 @@ const uint8_t localAddress = 0x06;     // Dirección de este dispositivo
 uint8_t destination = 0x05;            // Dirección de destino, 0xFF es la dirección de broadcast
 
 volatile bool txDoneFlag = true;       // Flag para indicar cuando ha finalizado una transmisión
+volatile bool
 
 // --------------------------------------------------------------------
 // Setup function
@@ -119,7 +120,7 @@ void loop()
 
     char message[50];
 
-    snprintf(message, sizeof(message),"Message no. %03d from 0x%02X", 
+    snprintf(message, sizeof(message),"SI", 
              msgCount, localAddress);
 
     transmitting = true;
@@ -183,6 +184,11 @@ void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCount)
   msgCount++;                             // Incrementamos el contador de mensajes
 }
 
+void firstSync(){
+
+}
+
+
 // --------------------------------------------------------------------
 // Receiving message function
 // --------------------------------------------------------------------
@@ -228,6 +234,11 @@ void onReceive(int packetSize)
   Serial.println("Message ID: " + String(incomingMsgId));
   Serial.println("Message length: " + String(incomingLength));
   Serial.println("Message: " + String(buffer));
+  if (buffer[0]=='S'){
+    if (buffer[1] == 'A'){
+      Serial.println("Sync Acknoledge");
+    }
+  }
   Serial.print("RSSI: " + String(LoRa.packetRssi()));
   Serial.println(" dBm\nSNR: " + String(LoRa.packetSnr()));
   Serial.println();
