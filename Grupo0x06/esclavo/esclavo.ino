@@ -1,239 +1,181 @@
-/* ---------------------------------------------------------------------
- *  Ejemplo MKR1310_LoRa_SendReceive_WithCallbacks
- *  Práctica 3
- *  Asignatura (GII-IoT)
- *  
- *  Basado en el ejemplo MKR1310_LoRa_SendReceive_WithReceiveCallback,
- *  muestra cómo es posible resolver la transmisión  
- *  y recepción de mensajes de forma asíncrona.
- *  Adicionalmente, monitorea el duty-cycle e intenta
- *  ajustar el intervalo entre la transmisión de paquetes
- *  para mantener el duty cycle por debajo del 1%.
- *  
- *  
- *  Este ejemplo requiere de una versión modificada
- *  de la librería Arduino LoRa (descargable desde 
- *  CV de la asignatura.
- *  
- *  También usa la librería Arduino_BQ24195 
- *  https://github.com/arduino-libraries/Arduino_BQ24195
- * ---------------------------------------------------------------------
- */
-
-#include <SPI.h>             
+#include <SPI.h>
 #include <LoRa.h>
-#include <Arduino_PMIC.h>
+#include <ArduinoPMIC.h>
 
-#define TX_LAPSE_MS          10000
+// Parámetros radio iniciales y direcciones
+const uint8_t localAddress = 0x05;      // Dirección de este esclavo
+const uint8_t masterAddress = 0x06;     // Dirección maestro
+const uint8_t SYNC_WORD = 0x12;
+#define TIMEOUT_MS 10000
 
-// NOTA: Ajustar estas variables 
-const uint8_t localAddress = 0x48;     // Dirección de este dispositivo
-uint8_t destination = 0xFF;            // Dirección de destino, 0xFF es la dirección de broadcast
+// Variables para configuración y respaldo
+uint32_t lastPacketTime = 0;
+uint8_t spreadingFactor = 7;
+long bandwidth = 125E3;
+uint8_t prev_spreadingFactor;
+long prev_bandwidth;
 
-volatile bool txDoneFlag = true;       // Flag para indicar cuando ha finalizado una transmisión
+// Estados de la máquina de sincronía
+enum SlaveState {
+  WAIT_SYNC,
+  WAIT_CONFIG,
+  WAIT_SYNCEND,
+  WAIT_MSG
+};
+SlaveState state = WAIT_SYNC;
 
-// --------------------------------------------------------------------
-// Setup function
-// --------------------------------------------------------------------
-void setup() 
+// Inicialización básica (igual que el original)
+bool init_PMIC()
 {
-  Serial.begin(9600);  
-  while (!Serial); 
-
-  Serial.println("LoRa Duplex with TxDone and Receive callbacks");
-
-  // Es posible indicar los pines para CS, reset e IRQ pins (opcional)
-  // LoRa.setPins(csPin, resetPin, irqPin);// set CS, reset, IRQ pin
-
-  
-  if (!init_PMIC()) {
-    Serial.println("Initilization of BQ24195L failed!");
+  bool error = false;
+  if (!PMIC.begin()) {
+    Serial.println("ERROR: Failed to initialize PMIC!");
+    return false;
   }
-  else {
-    Serial.println("Initilization of BQ24195L succeeded!");
-  }
-
-  if (!LoRa.begin(868E6)) {      // Initicializa LoRa a 868 MHz
-    Serial.println("LoRa init failed. Check your connections.");
-    while (true);                
-  }
-
-  // Configuramos algunos parámetros de la radio
-  LoRa.setSignalBandwidth(125E3); // 7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3
-                                  // 41.7E3, 62.5E3, 125E3, 250E3, 500E3 
-                                  // Multiplicar por dos el ancho de banda
-                                  // supone dividir a la mitad el tiempo de Tx
-  LoRa.setSpreadingFactor(12);     // [6, 12] Aumentar el spreading factor incrementa 
-  // original 7, nosotros 12
-  /*
-    //12
-    Sending 'Message no. 000 from 0xBB' ----> TX completed in 1652 msecs
-    Duty cycle: 16.5 %
-
-    Received from: 0x13
-    Sent to: 0xff
-    Message ID: 2
-    Message length: 15
-    Message: Roberto trabaja
-    RSSI: -85 dBm
-    SNR: 8.00
-  */
-                                  // de forma significativa el tiempo de Tx
-                                  // SPF = 6 es un valor especial
-                                  // Ver tabla 12 del manual del SEMTECH SX1276
-  LoRa.setSyncWord(0x12);         // Palabra de sincronización privada por defecto para SX127X 
-                                  // Usaremos la palabra de sincronización para crear diferentes
-                                  // redes privadas por equipos
-  LoRa.setCodingRate4(5);         // [5, 8] 5 da un tiempo de Tx menor
-  LoRa.setPreambleLength(8);      // Número de símbolos a usar como preámbulo
-
-  LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN); // Rango [2, 20] en dBm
-                                  // Importante seleccionar un valor bajo para pruebas
-                                  // a corta distancia y evitar saturar al receptor
-
-  // Indicamos el callback para cuando se reciba un paquete
-  LoRa.onReceive(onReceive);
-  
-  // Nótese que la recepción está activada a partir de este punto
-  LoRa.receive();
-
-  // Activamos el callback que nos indicará cuando ha finalizado la 
-  // transmisión de un mensaje
-  LoRa.onTxDone(TxFinished);
-
-  Serial.println("LoRa init succeeded.");
+  if (!PMIC.setInputCurrentLimit(2.0)) error = true;
+  if (!PMIC.setInputVoltageLimit(3.88)) error = true;
+  if (!PMIC.setMinimumSystemVoltage(3.5)) error = true;
+  if (!PMIC.setChargeVoltage(4.2)) error = true;
+  if (!PMIC.setChargeCurrent(0.375)) error = true;
+  if (!PMIC.enableCharge()) error = true;
+  delay(2000);
+  return !error;
 }
 
-// --------------------------------------------------------------------
-// Loop function
-// --------------------------------------------------------------------
-void loop() 
-{
-  static uint32_t lastSendTime_ms = 0;
-  static uint16_t msgCount = 0;
-  static uint32_t txInterval_ms = TX_LAPSE_MS;
-  static uint32_t tx_begin_ms = 0;
-  static bool transmitting = false;
-  
-  if (!transmitting && ((millis() - lastSendTime_ms) > txInterval_ms)) {
+// Cambia la configuración LoRa
+void updateRadio(uint8_t sf, long bw) {
+  LoRa.setSpreadingFactor(sf);
+  LoRa.setSignalBandwidth(bw);
+  spreadingFactor = sf;
+  bandwidth = bw;
+  Serial.print("Nueva config (SF, BW): "); Serial.print(sf); Serial.print(", "); Serial.println(bw);
+}
 
-    char message[50];
+// Reestablece la config anterior si hubo fallo
+void restorePrevConfig() {
+  updateRadio(prev_spreadingFactor, prev_bandwidth);
+}
 
-    snprintf(message, sizeof(message),"Message no. %03d from 0x%02X", 
-             msgCount, localAddress);
+// Serializa y parsea los paquetes de tipo SX/XY
+void parseConfigMsg(uint8_t *buf, uint8_t &sf, long &bw) {
+  sf = buf[0]; // p.ej., SF=7
+  // BW codificado como uint8_t (0=7.8,1=10.4,...,6=125,7=250,8=500 kHz, ver asignación si necesario)
+  switch(buf[1]) {
+    case 0: bw=7.8E3; break;   case 1: bw=10.4E3; break;  case 2: bw=15.6E3; break;
+    case 3: bw=20.8E3; break;  case 4: bw=31.25E3; break; case 5: bw=62.5E3; break;
+    case 6: bw=125E3; break;   case 7: bw=250E3; break;   case 8: bw=500E3; break;
+    default: bw=125E3; break;
+  }
+}
 
-    transmitting = true;
-    txDoneFlag = false;
-    tx_begin_ms = millis();
-  
-    sendMessage(message, uint8_t(strlen(message)), msgCount);
-    Serial.print("Sending '");
-    Serial.print(message);
-    Serial.print("' ");
-  }                  
-  
-  if (transmitting && txDoneFlag) {
-    uint32_t TxTime_ms = millis() - tx_begin_ms;
-    Serial.print("----> TX completed in ");
-    Serial.print(TxTime_ms);
-    Serial.println(" msecs");
-    
-    // Ajustamos txInterval_ms para respetar un duty cycle del 1% 
-    uint32_t lapse_ms = tx_begin_ms - lastSendTime_ms;
-    lastSendTime_ms = tx_begin_ms; 
-    float duty_cycle = (100.0f * TxTime_ms) / lapse_ms;
-    
-    Serial.print("Duty cycle: ");
-    Serial.print(duty_cycle,1);
-    Serial.println(" %\n");
+// Envía tipo 'ACK' (confirmación genérica)
+void sendACK(const char* ack_type) {
+  LoRa.beginPacket();
+  LoRa.write(masterAddress);
+  LoRa.write(localAddress);
+  LoRa.write((uint8_t)strlen(ack_type));
+  LoRa.print(ack_type);
+  LoRa.endPacket();
+  Serial.print("Enviado ACK: "); Serial.println(ack_type);
+}
 
-    // Solo si el ciclo de trabajo es superior al 1% lo ajustamos
-    // Dejamos random() solo para introducir cierta variabilidad
-    // y verificar que el mecanismo corrector funciona
-    if (duty_cycle <= 1.0f) {
-      txInterval_ms = random(TX_LAPSE_MS) + 1000; 
-    } else {
-      txInterval_ms = TxTime_ms * 100;
+// Callback recepción de paquete
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;
+
+  uint8_t recipient = LoRa.read();  // Destino
+  uint8_t sender = LoRa.read();     // Remitente
+  uint8_t msgLen = LoRa.read();
+
+  uint8_t payload[32];
+  for (int i = 0; i < msgLen && i < 32; i++)
+    payload[i] = LoRa.read();
+
+  String cmd = "";
+  for (int i=0; i < msgLen; i++) cmd += (char)payload[i];
+  lastPacketTime = millis();
+
+  Serial.print("RX cmd: "); Serial.println(cmd);
+
+  switch(state){
+    case WAIT_SYNC:  // Maestro inicia con 'SI'
+      if (cmd == "SI") {
+        sendACK("SA");
+        state = WAIT_CONFIG;
+      }
+      break;
+    case WAIT_CONFIG: // Esperar SXYY
+      if (cmd.startsWith("S")) {
+        // Guardar config anterior antes de aplicar
+        prev_spreadingFactor = spreadingFactor;
+        prev_bandwidth = bandwidth;
+        uint8_t tmp_sf; long tmp_bw;
+        parseConfigMsg(payload+1, tmp_sf, tmp_bw); // salta la 'S'
+        updateRadio(tmp_sf, tmp_bw);
+        sendACK("SA");
+        state = WAIT_SYNCEND;
+      } else if (cmd.startsWith("M")) {
+          sendACK("MA");
+          Serial.print("Mensaje recibido: ");
+          Serial.println(cmd.substring(1));
+          state = WAIT_MSG;
+      }
+      break;
+    case WAIT_SYNCEND: // Espera SE
+      if (cmd == "SE") {
+        sendACK("SA");
+        state = WAIT_CONFIG;
+      }
+      break;
+    case WAIT_MSG:
+      if (cmd.startsWith("M")) {
+          sendACK("MA");
+          Serial.print("Mensaje recibido: ");
+          Serial.println(cmd.substring(1));
+      } else if (cmd == "SI"){
+          sendACK("SA");
+          state = WAIT_CONFIG;
+      }
+      break;
+    default:
+      Serial.print("Error de protocolo");
+      break;
+  }
+}
+
+// Verifica timeout y restablece si necesario
+void checkTimeout() {
+  if ((millis() - lastPacketTime) > TIMEOUT_MS) {
+    Serial.println("Timeout detectado. Restableciendo estado/configuración.");
+    if (state == WAIT_SYNCEND) {
+      // Si ya cambiamos config, volver a anterior y cero
+      restorePrevConfig();
     }
-    
-    transmitting = false;
-    
-    // Reactivamos la recepción de mensajes, que se desactiva
-    // en segundo plano mientras se transmite
-    LoRa.receive();   
+    state = WAIT_SYNC; // Volver al principio del protocolo
+    sendACK("SA"); // Intentar resposición con el maestro
+    lastPacketTime = millis();
   }
 }
 
-// --------------------------------------------------------------------
-// Sending message function
-// --------------------------------------------------------------------
-void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCount) 
-{
-  while(!LoRa.beginPacket()) {            // Comenzamos el empaquetado del mensaje
-    delay(10);
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+  if (!init_PMIC()) Serial.println("Initilization of BQ24195L failed!");
+  if (!LoRa.begin(868E6)) {
+    Serial.println("LoRa init failed. Check your connections."); while (true);
   }
-  LoRa.write(destination);                // Añadimos el ID del destinatario
-  LoRa.write(localAddress);               // Añadimos el ID del remitente
-  LoRa.write((uint8_t)(msgCount >> 7));   // Añadimos el Id del mensaje (MSB primero)
-  LoRa.write((uint8_t)(msgCount & 0xFF)); 
-  LoRa.write(msgLength);                  // Añadimos la longitud en bytes del mensaje
-  LoRa.print(outgoing);                   // Añadimos el mensaje/payload
-  LoRa.endPacket(true);                   // Finalizamos el paquete, pero no esperamos a
-                                          // finalice su transmisión
-  msgCount++;                             // Incrementamos el contador de mensajes
+  LoRa.setSyncWord(SYNC_WORD);
+  LoRa.setPreambleLength(8);
+  LoRa.setCodingRate4(5);
+  LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN);
+  updateRadio(spreadingFactor, bandwidth);
+  LoRa.onReceive(onReceive);
+  LoRa.receive();
+  lastPacketTime = millis();
+  Serial.println("Esclavo LoRa listo.");
 }
 
-// --------------------------------------------------------------------
-// Receiving message function
-// --------------------------------------------------------------------
-void onReceive(int packetSize) 
-{
-  if (packetSize == 0) return;          // Si no hay mensajes, retornamos
-
-  // Leemos los primeros bytes del mensaje
-  char buffer[50];                      // Buffer para almacenar el mensaje
-  int recipient = LoRa.read();          // Dirección del destinatario
-  uint8_t sender = LoRa.read();         // Dirección del remitente
-                                        // msg ID (High Byte first)
-  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 7) | 
-                            (uint16_t)LoRa.read();
-  
-  uint8_t incomingLength = LoRa.read(); // Longitud en bytes del mensaje
-  
-  uint8_t receivedBytes = 0;            // Leemos el mensaje byte a byte
-  while (LoRa.available() && (receivedBytes < uint8_t(sizeof(buffer)-1))) {            
-    buffer[receivedBytes++] = (char)LoRa.read();
-  }
-  buffer[receivedBytes] = '\0';         // Terminamos la cadena
-
-  if (incomingLength != receivedBytes) {// Verificamos la longitud del mensaje
-    Serial.print("Receiving error: declared message length " + String(incomingLength));
-    Serial.println(" does not match length " + String(receivedBytes));
-    return;                             
-  }
-
-  // Verificamos si se trata de un mensaje en broadcast o es un mensaje
-  // dirigido específicamente a este dispositivo.
-  // Nótese que este mecanismo es complementario al uso de la misma
-  // SyncWord y solo tiene sentido si hay más de dos receptores activos
-  // compartiendo la misma palabra de sincronización
-  if ((recipient & localAddress) != localAddress ) {
-    Serial.println("Receiving error: This message is not for me.");
-    return;
-  }
-
-  // Imprimimos los detalles del mensaje recibido
-  Serial.println("Received from: 0x" + String(sender, HEX));
-  Serial.println("Sent to: 0x" + String(recipient, HEX));
-  Serial.println("Message ID: " + String(incomingMsgId));
-  Serial.println("Message length: " + String(incomingLength));
-  Serial.println("Message: " + String(buffer));
-  Serial.print("RSSI: " + String(LoRa.packetRssi()));
-  Serial.println(" dBm\nSNR: " + String(LoRa.packetSnr()));
-  Serial.println();
-}
-
-void TxFinished()
-{
-  txDoneFlag = true;
+void loop() {
+  checkTimeout();
+  // La recepción es gestionada por interrupción/callback
 }
