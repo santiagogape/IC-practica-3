@@ -1,6 +1,6 @@
 #include <SPI.h>
 #include <LoRa.h>
-#include <ArduinoPMIC.h>
+#include <Arduino_PMIC.h>
 
 // Parámetros radio iniciales y direcciones
 const uint8_t localAddress = 0x05;      // Dirección de este esclavo
@@ -14,6 +14,7 @@ uint8_t spreadingFactor = 7;
 long bandwidth = 125E3;
 uint8_t prev_spreadingFactor;
 long prev_bandwidth;
+uint32_t messageCount = 0;
 
 // Estados de la máquina de sincronía
 enum SlaveState {
@@ -23,24 +24,6 @@ enum SlaveState {
   WAIT_MSG
 };
 SlaveState state = WAIT_SYNC;
-
-// Inicialización básica (igual que el original)
-bool init_PMIC()
-{
-  bool error = false;
-  if (!PMIC.begin()) {
-    Serial.println("ERROR: Failed to initialize PMIC!");
-    return false;
-  }
-  if (!PMIC.setInputCurrentLimit(2.0)) error = true;
-  if (!PMIC.setInputVoltageLimit(3.88)) error = true;
-  if (!PMIC.setMinimumSystemVoltage(3.5)) error = true;
-  if (!PMIC.setChargeVoltage(4.2)) error = true;
-  if (!PMIC.setChargeCurrent(0.375)) error = true;
-  if (!PMIC.enableCharge()) error = true;
-  delay(2000);
-  return !error;
-}
 
 // Cambia la configuración LoRa
 void updateRadio(uint8_t sf, long bw) {
@@ -69,14 +52,19 @@ void parseConfigMsg(uint8_t *buf, uint8_t &sf, long &bw) {
 }
 
 // Envía tipo 'ACK' (confirmación genérica)
-void sendACK(const char* ack_type) {
-  LoRa.beginPacket();
-  LoRa.write(masterAddress);
-  LoRa.write(localAddress);
-  LoRa.write((uint8_t)strlen(ack_type));
-  LoRa.print(ack_type);
-  LoRa.endPacket();
-  Serial.print("Enviado ACK: "); Serial.println(ack_type);
+void sendACK(char* outgoing) {
+  uint8_t msgLength = uint8_t(strlen(outgoing));
+  while (!LoRa.beginPacket()) {
+    delay(10);
+  }
+  LoRa.write(masterAddress);                // Añadimos el ID del destinatario
+  LoRa.write(localAddress);               // Añadimos el ID del remitente
+  LoRa.write((uint8_t)(messageCount >> 7));   // Añadimos el Id del mensaje (MSB primero)
+  LoRa.write((uint8_t)(messageCount & 0xFF));
+  LoRa.write(msgLength);                  // Añadimos la longitud en bytes del mensaje
+  LoRa.print(outgoing);                   // Añadimos el mensaje/payload
+  LoRa.endPacket(true);                   // Finalizamos el paquete, pero no esperamos a su transmisión
+  messageCount++;
 }
 
 // Callback recepción de paquete
