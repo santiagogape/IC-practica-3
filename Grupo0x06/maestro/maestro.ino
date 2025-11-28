@@ -11,7 +11,7 @@
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
-#define TX_LAPSE_MS          10000
+#define TX_LAPSE_MS          15000
 
 // NOTA: Ajustar estas variables
 const uint8_t localAddress = 0x06;     // Dirección de este dispositivo
@@ -21,6 +21,8 @@ volatile bool txDoneFlag = true;       // Flag para indicar cuando ha finalizado
 
 // --- sync tests (valores de bandwidth/similares a los comentados)
 const uint32_t sync_tests[] = {7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000};
+const uint32_t sync_tests_sf[] = {7, 8, 9, 10, 11, 12, 0, 0, 0, 0};
+
 const uint8_t SYNC_TESTS_COUNT = sizeof(sync_tests) / sizeof(sync_tests[0]);
 
 // ------------------ Máquina de estados del protocolo -------------------
@@ -39,7 +41,7 @@ volatile SyncState syncState = IDLE;
 volatile SyncState protocolPendingState = IDLE;
 
 // Tiempo de espera para recibir el "SA"
-const uint32_t WAIT_TIMEOUT_MS = 5000; // ajustar si se quiere mayor tolerancia
+const uint32_t WAIT_TIMEOUT_MS = 10000; // ajustar si se quiere mayor tolerancia
 uint32_t waitStartTime = 0;
 
 // Variables para manejar envíos desde loop (no desde callback)
@@ -75,7 +77,6 @@ void setup()
 {
   Serial.begin(9600);
   while (!Serial);
-
   Serial.println("LoRa Duplex with TxDone and Receive callbacks - PROTOCOLO");
 
   if (!init_PMIC()) {
@@ -98,7 +99,7 @@ void setup()
   LoRa.setCodingRate4(5);
   LoRa.setPreambleLength(8);
   LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN);
-
+  LoRa.enableCrc();
   LoRa.onReceive(onReceive);
   LoRa.receive();
 
@@ -166,8 +167,13 @@ void loop()
       waitStartTime = millis(); // iniciamos timeout de espera del SA
       Serial.print("Protocol moved to state: ");
       switch (syncState) {
-        case WAIT_SA_AFTER_SI: Serial.println("WAIT_SA_AFTER_SI"); break;
-        case WAIT_SA_AFTER_TEST: Serial.println("WAIT_SA_AFTER_TEST"); break;
+        case WAIT_SA_AFTER_SI: 
+        LoRa.receive();
+        Serial.println("WAIT_SA_AFTER_SI"); break;
+        case WAIT_SA_AFTER_TEST: 
+        LoRa.receive();
+        Serial.println("WAIT_SA_AFTER_TEST"); 
+        break;
         case WAIT_SA_AFTER_CONFIG: Serial.println("WAIT_SA_AFTER_CONFIG"); break;
         default: Serial.println("OTHER"); break;
       }
@@ -242,7 +248,11 @@ void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCount)
 // --------------------------------------------------------------------
 void onReceive(int packetSize)
 {
-  if (packetSize == 0) return;
+  Serial.println("mensaje recibido");
+  if (packetSize == 0) {
+    Serial.println("mensaje vacio");
+    return;
+  } 
 
   char buffer[50];
   int recipient = LoRa.read();
@@ -288,8 +298,9 @@ void onReceive(int packetSize)
         // Debemos enviar un sync_test (valor) y despues esperar otro SA
         // Preparamos mensaje en pendingMsg para enviarlo desde loop()
         uint32_t val = sync_tests[syncIndex % SYNC_TESTS_COUNT];
+        uint8_t val2 = sync_tests_sf[syncIndex % SYNC_TESTS_COUNT];
         // convertir a cadena
-        snprintf(pendingMsg, sizeof(pendingMsg), "%lu", (unsigned long)val);
+        snprintf(pendingMsg, sizeof(pendingMsg), "X%luY%lu", (unsigned long)val, (unsigned long)val2);
         pendingMsgLen = strlen(pendingMsg);
         pendingSend = true;
         // cuando acabe el Tx, pasamos a WAIT_SA_AFTER_TEST
