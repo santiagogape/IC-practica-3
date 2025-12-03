@@ -1,80 +1,106 @@
+/* ---------------------------------------------------------------------
+ *  ESCLAVO LoRa - Protocolo de Sincronización CORREGIDO
+ *  
+ *  Protocolo:
+ *  1. Recibe "SI" → Responde "SA"
+ *  2. Recibe "XBWYSF" → Responde "SA" y CAMBIA configuración
+ *  3. Recibe "SE" (ya en nueva config) → Responde "SA"
+ *  4. Espera siguiente "XBWYSF" o nuevo "SI"
+ * ---------------------------------------------------------------------
+ */
+
 #include <SPI.h>
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
-const uint8_t localAddress  = 0x05;   // Dirección esclavo
-const uint8_t masterAddress = 0x06;   // Dirección maestro
+const uint8_t localAddress  = 0x05;
+const uint8_t masterAddress = 0x06;
 const uint8_t SYNC_WORD     = 0x12;
 #define TIMEOUT_MS 20000
 
 uint32_t lastPacketTime = 0;
-volatile uint8_t  spreadingFactor = 7;
-volatile long     bandwidth       = 7800;
-uint8_t  prev_spreadingFactor;
-long     prev_bandwidth;
+uint8_t spreadingFactor = 7;
+long bandwidth = 125000;
+uint8_t prev_spreadingFactor = 7;
+long prev_bandwidth = 125000;
 uint32_t messageCount = 0;
 
 enum SlaveState {
-  WAIT_SYNC,     // esperando "SI"
-  WAIT_CONFIG,   // esperando "SXXYY"
-  WAIT_SYNCEND,  // esperando "SE"
-  WAIT_MSG       // esperando "M"
+  WAIT_SYNC,
+  WAIT_CONFIG,
+  WAIT_SYNCEND,
+  READY
 };
 SlaveState state = WAIT_SYNC;
 
 void updateRadio(uint8_t sf, long bw) {
-  if ((sf < 6 || sf > 12) || (bw < 7800 || bw > 500000)){
-    Serial.print("Configuración errónea");
-    sf = 12;
+  if ((sf < 6 || sf > 12) || (bw < 7800 || bw > 500000)) {
+    Serial.println("!!! Configuración inválida, usando defaults !!!");
+    sf = 7;
     bw = 125000;
-  } else {
-    LoRa.setSpreadingFactor(sf);
-    LoRa.setSignalBandwidth(bw);
-    spreadingFactor = sf;
-    bandwidth = bw;
-    Serial.print("Nueva config (SF, BW): ");
-    Serial.print(sf);
-    Serial.print(", ");
-    Serial.println(bw);
-    LoRa.receive();
   }
+  
+  LoRa.idle();
+  LoRa.setSpreadingFactor(sf);
+  LoRa.setSignalBandwidth(bw);
+  spreadingFactor = sf;
+  bandwidth = bw;
+  
+  Serial.print("   Config aplicada - BW: ");
+  Serial.print(bw);
+  Serial.print(" Hz, SF: ");
+  Serial.println(sf);
+  
+  delay(50);
+  LoRa.receive();
 }
 
 void restorePrevConfig() {
+  Serial.println("   Restaurando configuración anterior");
   updateRadio(prev_spreadingFactor, prev_bandwidth);
 }
 
 void sendACK(const char* outgoing) {
   uint8_t msgLength = (uint8_t)strlen(outgoing);
+  
+  LoRa.idle();
+  delay(10);
+  
   while (!LoRa.beginPacket()) {
     delay(10);
   }
-  LoRa.write(masterAddress);                  // Añadimos el ID del destinatario
-  LoRa.write(localAddress);                   // Añadimos el ID del remitente
-  LoRa.write((uint8_t)(messageCount >> 7));   // Añadimos el Id del mensaje (MSB primero)
-  LoRa.write((uint8_t)(messageCount & 0xFF)); 
-  LoRa.write(msgLength);                      // Añadimos la longitud en bytes del mensaje
-  LoRa.print(outgoing);                       // Añadimos el mensaje/payload
-  LoRa.endPacket();                           // Finalizamos el paquete, pero no esperamos a su transmisión
-  messageCount++;                             // Incrementamos el contador de mensajes
+  
+  LoRa.write(masterAddress);
+  LoRa.write(localAddress);
+  LoRa.write((uint8_t)(messageCount >> 7));
+  LoRa.write((uint8_t)(messageCount & 0xFF));
+  LoRa.write(msgLength);
+  LoRa.print(outgoing);
+  LoRa.endPacket();
+  messageCount++;
 
-  Serial.print("ACK enviado: ");
-  Serial.println(outgoing);
+  Serial.print(">> ACK enviado: '");
+  Serial.print(outgoing);
+  Serial.println("'");
+  
+  delay(50);
   LoRa.receive();
 }
 
 bool parseXBWYSF(const String cmd, long* bw, uint8_t* sf) {
-  if (cmd.length() < 7) return false;  //minimo X7800Y6
+  if (cmd.length() < 5) return false;
   if (cmd[0] != 'X') return false;
+  
   int idxY = cmd.indexOf('Y');
-  if (idxY <= 4 || idxY >= cmd.length() - 1) return false;
+  if (idxY <= 1 || idxY >= cmd.length() - 1) return false;
 
-  String bwStr = cmd.substring(1, idxY);     // entre X e Y
-  String sfStr = cmd.substring(idxY + 1);    // tras Y
+  String bwStr = cmd.substring(1, idxY);
+  String sfStr = cmd.substring(idxY + 1);
 
   long bwVal = bwStr.toInt();
-  int  sfVal = sfStr.toInt();
-  if (bwVal < 7800 || bwVal > 500000)  return false;
+  int sfVal = sfStr.toInt();
+  
+  if (bwVal < 7800 || bwVal > 500000) return false;
   if (sfVal < 6 || sfVal > 12) return false;
 
   *bw = bwVal;
@@ -82,18 +108,15 @@ bool parseXBWYSF(const String cmd, long* bw, uint8_t* sf) {
   return true;
 }
 
-// Callback
 void onReceive(int packetSize) {
   if (packetSize == 0) return;
 
   uint8_t recipient = LoRa.read();
-  uint8_t sender    = LoRa.read();
-  uint16_t msgID    = ((uint16_t)LoRa.read() << 7) | (uint16_t)LoRa.read();
-  uint8_t msgLen    = LoRa.read();
+  uint8_t sender = LoRa.read();
+  uint16_t msgID = ((uint16_t)LoRa.read() << 7) | (uint16_t)LoRa.read();
+  uint8_t msgLen = LoRa.read();
 
   if (recipient != localAddress && recipient != 0xFF) {
-    Serial.print("Mensaje no es para mí. Destino: 0x");
-    Serial.println(recipient, HEX);
     while (LoRa.available()) LoRa.read();
     return;
   }
@@ -108,78 +131,97 @@ void onReceive(int packetSize) {
   String cmd = String(payload);
   lastPacketTime = millis();
 
-  Serial.println("---- Paquete recibido ----");
-  Serial.print("De: 0x");   Serial.println(sender, HEX);
-  Serial.print("Para: 0x"); Serial.println(recipient, HEX);
-  Serial.print("ID: ");     Serial.println(msgID);
-  Serial.print("Len: ");    Serial.println(msgLen);
-  Serial.print("CMD: ");    Serial.println(cmd);
-  Serial.print("RSSI: ");   Serial.println(LoRa.packetRssi());
-  Serial.print("SNR: ");    Serial.println(LoRa.packetSnr());
-  Serial.println("--------------------------");
+  Serial.print("<< Recibido: '");
+  Serial.print(cmd);
+  Serial.print("' | RSSI: ");
+  Serial.print(LoRa.packetRssi());
+  Serial.print(" dBm | SNR: ");
+  Serial.print(LoRa.packetSnr());
+  Serial.print(" | Estado: ");
 
   switch (state) {
-
     case WAIT_SYNC:
+      Serial.println("WAIT_SYNC");
       if (cmd == "SI") {
+        Serial.println("   Iniciando sincronización");
         sendACK("SA");
         state = WAIT_CONFIG;
       }
       break;
 
     case WAIT_CONFIG:
+      Serial.println("WAIT_CONFIG");
       if (cmd.startsWith("X")) {
         prev_spreadingFactor = spreadingFactor;
-        prev_bandwidth       = bandwidth;
+        prev_bandwidth = bandwidth;
 
         uint8_t tmp_sf;
-        long    tmp_bw;
+        long tmp_bw;
+        
         if (parseXBWYSF(cmd, &tmp_bw, &tmp_sf)) {
+          Serial.print("   Nueva config solicitada - BW: ");
+          Serial.print(tmp_bw);
+          Serial.print(", SF: ");
+          Serial.println(tmp_sf);
+          
           sendACK("SA");
           updateRadio(tmp_sf, tmp_bw);
           state = WAIT_SYNCEND;
         } else {
-          Serial.println("Formato XBWYSF inválido, ignorando.");
+          Serial.println("   Error: formato XBWYSF inválido");
         }
       }
-      else if (cmd.startsWith("M")) {
-        sendACK("MA");
-        Serial.print("Mensaje recibido: ");
-        Serial.println(cmd.substring(1));
-        state = WAIT_MSG;
-      }
-      break;
-
-    case WAIT_SYNCEND:
-      if (cmd == "SE"){
+      else if (cmd == "SI") {
+        Serial.println("   Re-iniciando sincronización");
         sendACK("SA");
         state = WAIT_CONFIG;
       }
       break;
 
-    case WAIT_MSG:
+    case WAIT_SYNCEND:
+      Serial.println("WAIT_SYNCEND");
+      if (cmd == "SE") {
+        Serial.println("   Ciclo de sincronización completado");
+        sendACK("SA");
+        state = WAIT_CONFIG; // Listo para siguiente config
+      }
+      else if (cmd == "SI") {
+        Serial.println("   Re-iniciando desde SI");
+        restorePrevConfig();
+        sendACK("SA");
+        state = WAIT_CONFIG;
+      }
+      break;
+
+    case READY:
+      Serial.println("READY");
       if (cmd.startsWith("M")) {
         sendACK("MA");
-        Serial.print("Mensaje recibido: ");
+        Serial.print("   Mensaje: ");
         Serial.println(cmd.substring(1));
-      } else if (cmd == "SI") {
+      }
+      else if (cmd == "SI") {
+        Serial.println("   Nueva sincronización");
         sendACK("SA");
         state = WAIT_CONFIG;
       }
       break;
 
     default:
-      Serial.println("Error de protocolo: estado desconocido.");
+      Serial.println("ERROR - Estado desconocido");
+      state = WAIT_SYNC;
       break;
   }
+  
+  Serial.println();
 }
 
 void checkTimeout() {
   if ((millis() - lastPacketTime) > TIMEOUT_MS) {
-    Serial.println("Timeout detectado. Restableciendo estado/configuración.");
-    if (state == WAIT_CONFIG || state == WAIT_MSG) {
-      restorePrevConfig();
-    }
+    Serial.println("\n!!! TIMEOUT detectado !!!");
+    Serial.println("Restaurando estado y configuración inicial\n");
+    
+    restorePrevConfig();
     state = WAIT_SYNC;
     LoRa.receive();
     lastPacketTime = millis();
@@ -189,13 +231,16 @@ void checkTimeout() {
 void setup() {
   Serial.begin(9600);
   while (!Serial);
+  Serial.println("=== ESCLAVO LoRa - Protocolo Sincronización ===");
 
   if (!init_PMIC()) {
-    Serial.println("Initilization of BQ24195L failed!");
+    Serial.println("Error: Inicialización BQ24195L fallida");
+  } else {
+    Serial.println("OK: BQ24195L inicializado");
   }
 
   if (!LoRa.begin(868E6)) {
-    Serial.println("LoRa init failed. Check your connections.");
+    Serial.println("Error: LoRa init failed");
     while (true);
   }
 
@@ -203,7 +248,7 @@ void setup() {
   LoRa.setPreambleLength(8);
   LoRa.setCodingRate4(5);
   LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN);
-  LoRa.enableCrc();  // CRC activado
+  LoRa.enableCrc();
 
   updateRadio(spreadingFactor, bandwidth);
 
@@ -211,9 +256,16 @@ void setup() {
   LoRa.receive();
 
   lastPacketTime = millis();
-  Serial.println("Esclavo LoRa listo.");
+  
+  Serial.print("Config inicial - BW: ");
+  Serial.print(bandwidth);
+  Serial.print(" Hz, SF: ");
+  Serial.println(spreadingFactor);
+  Serial.println("Esperando sincronización...");
+  Serial.println("===========================================\n");
 }
 
 void loop() {
   checkTimeout();
+  delay(10);
 }
