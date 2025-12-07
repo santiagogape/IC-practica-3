@@ -16,19 +16,22 @@
 const uint8_t localAddress  = 0x05;
 const uint8_t masterAddress = 0x06;
 const uint8_t SYNC_WORD     = 0x12;
-#define TIMEOUT_MS 20000
+#define TIMEOUT_MS 15000
 
 uint32_t lastPacketTime = 0;
 uint8_t spreadingFactor = 7;
 long bandwidth = 125000;
+uint8_t txPower = 3;
 uint8_t prev_spreadingFactor = 7;
 long prev_bandwidth = 125000;
+uint8_t prev_tx = 3;
 uint32_t messageCount = 0;
 
 enum SlaveState {
   WAIT_SYNC,
   WAIT_CONFIG,
   WAIT_SYNCEND,
+  WAIT_TX,
   READY
 };
 SlaveState state = WAIT_SYNC;
@@ -55,9 +58,28 @@ void updateRadio(uint8_t sf, long bw) {
   LoRa.receive();
 }
 
+void updateRadioTX(uint8_t tx) {
+  if (tx < 3 || tx > 12) {
+    Serial.println("!!! Configuración inválida, usando default !!!");
+    tx = 3;
+  }
+  LoRa.idle();
+  LoRa.setTxPower(tx, PA_OUTPUT_PA_BOOST_PIN);
+  txPower = tx;
+  Serial.print("   TX aplicado - TX: ");
+  Serial.println(tx);
+  delay(50);
+  LoRa.receive();
+}
+
 void restorePrevConfig() {
   Serial.println("   Restaurando configuración anterior");
   updateRadio(prev_spreadingFactor, prev_bandwidth);
+}
+
+void restorePrevTX(){
+  Serial.println("Restaurando TX anterior");
+  updateRadioTX(prev_tx);
 }
 
 void sendACK(const char* outgoing) {
@@ -108,6 +130,17 @@ bool parseXBWYSF(const String cmd, long* bw, uint8_t* sf) {
   return true;
 }
 
+bool parseTX(const String cmd, uint8_t* tx) {
+  if (cmd.length() < 2) return false;
+  if (cmd[0] != 'T') return false;
+
+  String txStr = cmd.substring(1);
+  int txVal = txStr.toInt();
+  if (txVal < 3 || txVal > 12) return false;
+  *tx = (uint8_t)txVal;
+  return true;
+}
+
 void onReceive(int packetSize) {
   if (packetSize == 0) return;
 
@@ -147,6 +180,11 @@ void onReceive(int packetSize) {
         sendACK("SA");
         state = WAIT_CONFIG;
       }
+      if(cmd == "ST"){
+        Serial.println("Iniciando sincronización de TX");
+        sendACK("SA");
+        state = WAIT_TX;
+      }
       break;
 
     case WAIT_CONFIG:
@@ -170,11 +208,15 @@ void onReceive(int packetSize) {
         } else {
           Serial.println("   Error: formato XBWYSF inválido");
         }
-      }
-      else if (cmd == "SI") {
+      }else if (cmd == "SI") {
         Serial.println("   Re-iniciando sincronización");
         sendACK("SA");
         state = WAIT_CONFIG;
+      }
+      if(cmd == "ST"){
+        Serial.println("Iniciando sincronización de TX");
+        sendACK("SA");
+        state = WAIT_TX;
       }
       break;
 
@@ -191,6 +233,17 @@ void onReceive(int packetSize) {
         sendACK("SA");
         state = WAIT_CONFIG;
       }
+      if(cmd == "ST"){
+        Serial.println("Iniciando sincronización de TX");
+        sendACK("SA");
+        state = WAIT_TX;
+      }
+      if (cmd.startsWith("M")) {
+        sendACK("MA");
+        Serial.print("   Mensaje: ");
+        Serial.println(cmd.substring(1));
+        state = READY;
+      }
       break;
 
     case READY:
@@ -204,6 +257,42 @@ void onReceive(int packetSize) {
         Serial.println("   Nueva sincronización");
         sendACK("SA");
         state = WAIT_CONFIG;
+      }
+      if(cmd == "ST"){
+        Serial.println("Iniciando sincronización de TX");
+        sendACK("SA");
+        state = WAIT_TX;
+      }
+      break;
+    case WAIT_TX:
+    Serial.println("WAIT_TX");
+      if (cmd.startsWith("T")) {
+        prev_tx = txPower;
+        uint8_t tmp_tx;
+        if (parseTX(cmd, &tmp_tx)) {
+          Serial.print("   Nuevo TX solicitado - TX: ");
+          Serial.print(tmp_tx);
+          sendACK("SA");
+          updateRadioTX(tmp_tx);
+          state = WAIT_SYNCEND;
+        } else {
+          Serial.println("   Error: formato TX inválido");
+        }
+      }else if (cmd == "SI") {
+        Serial.println("   Re-iniciando sincronización");
+        sendACK("SA");
+        state = WAIT_CONFIG;
+      }
+      if(cmd == "ST"){
+        Serial.println("Iniciando sincronización de TX");
+        sendACK("SA");
+        state = WAIT_TX;
+      }
+      if (cmd.startsWith("M")) {
+        sendACK("MA");
+        Serial.print("   Mensaje: ");
+        Serial.println(cmd.substring(1));
+        state = READY;
       }
       break;
 
@@ -220,8 +309,8 @@ void checkTimeout() {
   if ((millis() - lastPacketTime) > TIMEOUT_MS) {
     Serial.println("\n!!! TIMEOUT detectado !!!");
     Serial.println("Restaurando estado y configuración inicial\n");
-    
     restorePrevConfig();
+    restorePrevTX();
     state = WAIT_SYNC;
     LoRa.receive();
     lastPacketTime = millis();
@@ -247,10 +336,10 @@ void setup() {
   LoRa.setSyncWord(SYNC_WORD);
   LoRa.setPreambleLength(8);
   LoRa.setCodingRate4(5);
-  LoRa.setTxPower(3, PA_OUTPUT_PA_BOOST_PIN);
   LoRa.enableCrc();
 
   updateRadio(spreadingFactor, bandwidth);
+  updateRadioTX(txPower);
 
   LoRa.onReceive(onReceive);
   LoRa.receive();
