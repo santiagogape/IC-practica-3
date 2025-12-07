@@ -52,6 +52,10 @@ uint8_t currentSF = 7;
 // Índice de configuración
 uint8_t syncIndex = 0;
 
+//Las conf
+volatile uint8_t prev_spreadingFactor = 7;
+volatile long prev_bandwidth = 125000;
+
 // Variables de control de transmisión
 static uint32_t lastSendTime_ms = 0;
 static uint16_t msgCount = 0;
@@ -169,8 +173,8 @@ void loop() {
     syncIndex = 0;
     
     // Volver a config inicial
-    LoRa.setSignalBandwidth(125000);
-    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(prev_bandwidth);
+    LoRa.setSpreadingFactor(prev_spreadingFactor);
     currentBW = 125000;
     currentSF = 7;
     
@@ -179,7 +183,8 @@ void loop() {
 
   // Iniciar protocolo automáticamente
   static bool protocolStarted = false;
-  if (!protocolStarted && syncState == IDLE && !transmitting) {
+  //  if (!protocolStarted && syncState == IDLE && !transmitting) {
+  if (syncState == IDLE && !transmitting) {
     Serial.println("\n>>> Iniciando protocolo de sincronización <<<\n");
     strcpy(pendingMsg, "SI");
     pendingMsgLen = 2;
@@ -271,6 +276,8 @@ void onReceive(int packetSize) {
       
       LoRa.setSignalBandwidth(newBW);
       LoRa.setSpreadingFactor(newSF);
+      prev_spreadingFactor = currentSF;
+      prev_bandwidth = currentBW;
       currentBW = newBW;
       currentSF = newSF;
       
