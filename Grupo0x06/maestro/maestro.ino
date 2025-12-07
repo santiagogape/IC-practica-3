@@ -15,6 +15,12 @@
  *  3. Maestro cambia a la nueva configuración
  *  4. Maestro envía "SE" con nueva config → Esclavo responde "SA"
  *  5. Repite desde paso 2 con siguiente configuración
+ *
+ *  Autores:
+ * · Nicolás Rey Alonso
+ * · José Manuel Díaz Hernández
+ * · Santiago galindo Peralta
+ * · Alberto Martel Rodríguez
  * ---------------------------------------------------------------------
  */
 

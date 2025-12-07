@@ -6,6 +6,12 @@
  *  2. Recibe "XBWYSF" → Responde "SA" y CAMBIA configuración
  *  3. Recibe "SE" (ya en nueva config) → Responde "SA"
  *  4. Espera siguiente "XBWYSF" o nuevo "SI"
+ *
+ *  Autores:
+ * · Nicolás Rey Alonso
+ * · José Manuel Díaz Hernández
+ * · Santiago galindo Peralta
+ * · Alberto Martel Rodríguez
  * ---------------------------------------------------------------------
  */
 
