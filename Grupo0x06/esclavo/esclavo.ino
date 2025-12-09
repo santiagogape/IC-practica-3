@@ -1,19 +1,12 @@
-/* ---------------------------------------------------------------------
- *  ESCLAVO LoRa - Protocolo de Sincronización CORREGIDO
- *  
- *  Protocolo:
- *  1. Recibe "SI" → Responde "SA"
- *  2. Recibe "XBWYSF" → Responde "SA" y CAMBIA configuración
- *  3. Recibe "SE" (ya en nueva config) → Responde "SA"
- *  4. Espera siguiente "XBWYSF" o nuevo "SI"
- *
- *  Autores:
- * · Nicolás Rey Alonso
- * · José Manuel Díaz Hernández
- * · Santiago galindo Peralta
- * · Alberto Martel Rodríguez
- * ---------------------------------------------------------------------
- */
+
+/* ------------------------------------------------------------
+ * ESCLAVO LoRa - Protocolo de Sincronización + Resync + Status
+ * Dirección local: 0x05, Maestro: 0x06, SyncWord: 0x12
+ * - FSM robusta para TX y BW/SF
+ * - Respuestas a QS (SSX...Y...T...) y RS (resync)
+ * - ACK "MA" ante mensajes "MXXXXXXXXX"
+ * - ID mensaje 16-bit correcto
+ * ------------------------------------------------------------ */
 
 #include <SPI.h>
 #include <LoRa.h>
@@ -22,283 +15,250 @@
 const uint8_t localAddress  = 0x05;
 const uint8_t masterAddress = 0x06;
 const uint8_t SYNC_WORD     = 0x12;
+
 #define TIMEOUT_MS 15000
 
-uint32_t lastPacketTime = 0;
-uint8_t spreadingFactor = 7;
-long bandwidth = 125000;
-uint8_t txPower = 3;
-uint8_t prev_spreadingFactor = 7;
-long prev_bandwidth = 125000;
-uint8_t prev_tx = 3;
-uint32_t messageCount = 0;
+// Config original segura
+#define ORIGINAL_BW 125000L
+#define ORIGINAL_SF 7
+#define ORIGINAL_TX 3
 
-enum SlaveState {
-  WAIT_SYNC,
-  WAIT_CONFIG,
-  WAIT_SYNCEND,
-  WAIT_TX,
-  READY
-};
-SlaveState state = WAIT_SYNC;
+// Estado y configuración
+uint32_t lastPacketTime  = 0;
+uint8_t  spreadingFactor = ORIGINAL_SF;
+long     bandwidth       = ORIGINAL_BW;
+uint8_t  txPower         = ORIGINAL_TX;
 
-void updateRadio(uint8_t sf, long bw) {
-  if ((sf < 6 || sf > 12) || (bw < 7800 || bw > 500000)) {
-    Serial.println("!!! Configuración inválida, usando defaults !!!");
-    sf = 7;
-    bw = 125000;
+// Copias previas para rollback en timeout
+uint8_t  prev_spreadingFactor = ORIGINAL_SF;
+long     prev_bandwidth       = ORIGINAL_BW;
+uint8_t  prev_tx              = ORIGINAL_TX;
+
+uint16_t messageCount = 0;
+
+// ----------------- Helpers -----------------
+bool isValidBandwidth(long bw) {
+  const long allowed[] = {7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000};
+  for (unsigned i = 0; i < sizeof(allowed)/sizeof(allowed[0]); ++i) {
+    if (bw == allowed[i]) return true;
   }
-  
+  return false;
+}
+
+void applyRadioBW_SF(uint8_t sf, long bw) {
+  if (!isValidBandwidth(bw) || sf < 6 || sf > 12) {
+    Serial.println("!!! Configuración inválida, usando defaults !!!");
+    sf = ORIGINAL_SF; bw = ORIGINAL_BW;
+  }
   LoRa.idle();
   LoRa.setSpreadingFactor(sf);
   LoRa.setSignalBandwidth(bw);
   spreadingFactor = sf;
-  bandwidth = bw;
-  
-  Serial.print("   Config aplicada - BW: ");
-  Serial.print(bw);
-  Serial.print(" Hz, SF: ");
-  Serial.println(sf);
-  
+  bandwidth       = bw;
+  Serial.print(" Config aplicada - BW: "); Serial.print(bw);
+  Serial.print(" Hz, SF: "); Serial.println(sf);
   delay(50);
   LoRa.receive();
 }
 
-void updateRadioTX(uint8_t tx) {
-  if (tx < 3 || tx > 12) {
-    Serial.println("!!! Configuración inválida, usando default !!!");
-    tx = 3;
+void applyRadioTX(uint8_t tx) {
+  if (tx < 2 || tx > 20) {
+    Serial.println("!!! TX inválido, usando default !!!");
+    tx = ORIGINAL_TX;
   }
   LoRa.idle();
   LoRa.setTxPower(tx, PA_OUTPUT_PA_BOOST_PIN);
   txPower = tx;
-  Serial.print("   TX aplicado - TX: ");
-  Serial.println(tx);
+  Serial.print(" TX aplicado - TX: "); Serial.println(tx);
   delay(50);
   LoRa.receive();
 }
 
 void restorePrevConfig() {
-  Serial.println("   Restaurando configuración anterior");
-  updateRadio(prev_spreadingFactor, prev_bandwidth);
+  Serial.println(" Restaurando configuración anterior (BW/SF)");
+  applyRadioBW_SF(prev_spreadingFactor, prev_bandwidth);
 }
 
-void restorePrevTX(){
-  Serial.println("Restaurando TX anterior");
-  updateRadioTX(prev_tx);
+void restorePrevTX() {
+  Serial.println(" Restaurando TX anterior");
+  applyRadioTX(prev_tx);
 }
 
 void sendACK(const char* outgoing) {
   uint8_t msgLength = (uint8_t)strlen(outgoing);
-  
   LoRa.idle();
-  delay(10);
-  
-  while (!LoRa.beginPacket()) {
-    delay(10);
-  }
-  
-  LoRa.write(masterAddress);
-  LoRa.write(localAddress);
-  LoRa.write((uint8_t)(messageCount >> 7));
-  LoRa.write((uint8_t)(messageCount & 0xFF));
+  delay(5);
+  while (!LoRa.beginPacket()) { delay(5); }
+  LoRa.write(masterAddress);               // destino
+  LoRa.write(localAddress);                // origen
+  LoRa.write((uint8_t)(messageCount >> 8));// ID alto
+  LoRa.write((uint8_t)(messageCount & 0xFF));// ID bajo
   LoRa.write(msgLength);
   LoRa.print(outgoing);
-  LoRa.endPacket();
+  LoRa.endPacket(); // sync
   messageCount++;
-
-  Serial.print(">> ACK enviado: '");
-  Serial.print(outgoing);
-  Serial.println("'");
-  
-  delay(50);
+  Serial.print(">> ACK enviado: '"); Serial.print(outgoing); Serial.println("'");
+  delay(30);
   LoRa.receive();
 }
 
-bool parseXBWYSF(const String cmd, long* bw, uint8_t* sf) {
+bool parseXBWYSF(const String& cmd, long* bw, uint8_t* sf) {
   if (cmd.length() < 5) return false;
-  if (cmd[0] != 'X') return false;
-  
+  if (cmd[0] != 'X')     return false;
   int idxY = cmd.indexOf('Y');
-  if (idxY <= 1 || idxY >= cmd.length() - 1) return false;
-
-  String bwStr = cmd.substring(1, idxY);
-  String sfStr = cmd.substring(idxY + 1);
-
-  long bwVal = bwStr.toInt();
-  int sfVal = sfStr.toInt();
-  
-  if (bwVal < 7800 || bwVal > 500000) return false;
-  if (sfVal < 6 || sfVal > 12) return false;
-
-  *bw = bwVal;
-  *sf = (uint8_t)sfVal;
+  if (idxY <= 1 || idxY >= cmd.length()-1) return false;
+  long bwVal = cmd.substring(1, idxY).toInt();
+  int  sfVal = cmd.substring(idxY + 1).toInt();
+  if (!isValidBandwidth(bwVal)) return false;
+  if (sfVal < 6 || sfVal > 12)  return false;
+  *bw = bwVal; *sf = (uint8_t)sfVal;
   return true;
 }
 
-bool parseTX(const String cmd, uint8_t* tx) {
+bool parseTX(const String& cmd, uint8_t* tx) {
   if (cmd.length() < 2) return false;
-  if (cmd[0] != 'T') return false;
-
-  String txStr = cmd.substring(1);
-  int txVal = txStr.toInt();
-  if (txVal < 3 || txVal > 12) return false;
+  if (cmd[0] != 'T')    return false;
+  int txVal = cmd.substring(1).toInt();
+  if (txVal < 2 || txVal > 20) return false;
   *tx = (uint8_t)txVal;
   return true;
 }
 
+// ----------------- FSM -----------------
+enum SlaveState {
+  WAIT_SYNC,      // espera SI (BWSF) o ST (TX)
+  WAIT_CONFIG,    // espera XBWYSF
+  WAIT_SYNCEND,   // espera SE
+  WAIT_TX,        // espera Txx
+  READY
+};
+SlaveState state = WAIT_SYNC;
+
+// ----------------- onReceive -----------------
 void onReceive(int packetSize) {
   if (packetSize == 0) return;
 
   uint8_t recipient = LoRa.read();
-  uint8_t sender = LoRa.read();
-  uint16_t msgID = ((uint16_t)LoRa.read() << 7) | (uint16_t)LoRa.read();
-  uint8_t msgLen = LoRa.read();
+  uint8_t sender    = LoRa.read();
+  uint16_t msgID    = ((uint16_t)LoRa.read() << 8) | (uint16_t)LoRa.read();
+  uint8_t  msgLen   = LoRa.read();
 
   if (recipient != localAddress && recipient != 0xFF) {
-    while (LoRa.available()) LoRa.read();
+    while (LoRa.available()) LoRa.read(); // purge
     return;
   }
 
-  char payload[32];
+  char payload[60];
   uint8_t i = 0;
-  while (LoRa.available() && i < sizeof(payload) - 1 && i < msgLen) {
+  while (LoRa.available() && i < sizeof(payload)-1 && i < msgLen) {
     payload[i++] = (char)LoRa.read();
   }
   payload[i] = '\0';
-
   String cmd = String(payload);
+
   lastPacketTime = millis();
+  Serial.print("<< Recibido: '"); Serial.print(cmd);
+  Serial.print("'  RSSI: "); Serial.print(LoRa.packetRssi());
+  Serial.print(" dBm  SNR: "); Serial.println(LoRa.packetSnr());
 
-  Serial.print("<< Recibido: '");
-  Serial.print(cmd);
-  Serial.print("' | RSSI: ");
-  Serial.print(LoRa.packetRssi());
-  Serial.print(" dBm | SNR: ");
-  Serial.print(LoRa.packetSnr());
-  Serial.print(" | Estado: ");
+  // ----- Control inmediato: RS (resync) y QS (status) -----
+  if (cmd == "RS") {
+    Serial.println("** RESYNC (RS) **");
+    applyRadioBW_SF(ORIGINAL_SF, ORIGINAL_BW);
+    applyRadioTX(ORIGINAL_TX);
+    sendACK("SA");
+    state = WAIT_SYNC;
+    delay(40); LoRa.receive();
+    return;
+  }
+  if (cmd == "QS") {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "SSX%ldY%uT%u", bandwidth, spreadingFactor, txPower);
+    sendACK(buf);
+    delay(20); LoRa.receive();
+    return;
+  }
 
+  // ----- ACK "MA" ante mensajes "M..." -----
+  if (cmd.length() >= 1 && cmd[0] == 'M') {
+    sendACK("MA"); // confirma recepción del mensaje de datos
+    Serial.print(" Mensaje M: "); Serial.println(cmd.substring(1));
+    // No cambia el estado de la FSM
+    return;
+  }
+
+  // ----- Protocolo principal -----
   switch (state) {
     case WAIT_SYNC:
-      Serial.println("WAIT_SYNC");
-      if (cmd == "SI") {
-        Serial.println("   Iniciando sincronización");
-        sendACK("SA");
-        state = WAIT_CONFIG;
-      }
-      if(cmd == "ST"){
-        Serial.println("Iniciando sincronización de TX");
-        sendACK("SA");
-        state = WAIT_TX;
+      if (cmd == "SI") {                 // inicio BW/SF
+        sendACK("SA"); state = WAIT_CONFIG;
+      } else if (cmd == "ST") {          // inicio TX
+        sendACK("SA"); state = WAIT_TX;
       }
       break;
 
-    case WAIT_CONFIG:
-      Serial.println("WAIT_CONFIG");
+    case WAIT_CONFIG:                    // esperando XBWYSF
       if (cmd.startsWith("X")) {
         prev_spreadingFactor = spreadingFactor;
-        prev_bandwidth = bandwidth;
-
-        uint8_t tmp_sf;
-        long tmp_bw;
-        
+        prev_bandwidth       = bandwidth;
+        uint8_t tmp_sf; long tmp_bw;
         if (parseXBWYSF(cmd, &tmp_bw, &tmp_sf)) {
-          Serial.print("   Nueva config solicitada - BW: ");
-          Serial.print(tmp_bw);
-          Serial.print(", SF: ");
-          Serial.println(tmp_sf);
-          
           sendACK("SA");
-          updateRadio(tmp_sf, tmp_bw);
-          state = WAIT_SYNCEND;
+          applyRadioBW_SF(tmp_sf, tmp_bw);
+          state = WAIT_SYNCEND;          // ahora espera SE
         } else {
-          Serial.println("   Error: formato XBWYSF inválido");
+          Serial.println(" Error: formato XBWYSF inválido");
         }
-      }else if (cmd == "SI") {
-        Serial.println("   Re-iniciando sincronización");
-        sendACK("SA");
-        state = WAIT_CONFIG;
-      }
-      if(cmd == "ST"){
-        Serial.println("Iniciando sincronización de TX");
-        sendACK("SA");
-        state = WAIT_TX;
+      } else if (cmd == "SI") {          // re-inicio BW/SF
+        sendACK("SA"); state = WAIT_CONFIG;
+      } else if (cmd == "ST") {          // salto a TX
+        sendACK("SA"); state = WAIT_TX;
       }
       break;
 
-    case WAIT_SYNCEND:
-      Serial.println("WAIT_SYNCEND");
+    case WAIT_SYNCEND:                   // esperando SE para cerrar ciclo
       if (cmd == "SE") {
-        Serial.println("   Ciclo de sincronización completado");
         sendACK("SA");
-        state = WAIT_CONFIG; // Listo para siguiente config
-      }
-      else if (cmd == "SI") {
-        Serial.println("   Re-iniciando desde SI");
+        state = WAIT_CONFIG;             // listo para siguiente XBWYSF o SI
+      } else if (cmd == "SI") {          // reinicio suave
         restorePrevConfig();
-        sendACK("SA");
-        state = WAIT_CONFIG;
-      }
-      if(cmd == "ST"){
-        Serial.println("Iniciando sincronización de TX");
-        sendACK("SA");
-        state = WAIT_TX;
-      }
-      if (cmd.startsWith("M")) {
+        sendACK("SA"); state = WAIT_CONFIG;
+      } else if (cmd == "ST") {          // pasar a TX
+        sendACK("SA"); state = WAIT_TX;
+      } else if (cmd.startsWith("M")) {  // mensajes libres
         sendACK("MA");
-        Serial.print("   Mensaje: ");
-        Serial.println(cmd.substring(1));
-        state = READY;
+        Serial.print(" Mensaje: "); Serial.println(cmd.substring(1));
+        // state se mantiene o pasa a READY si lo prefieres
       }
       break;
 
     case READY:
-      Serial.println("READY");
       if (cmd.startsWith("M")) {
-        sendACK("MA");
-        Serial.print("   Mensaje: ");
-        Serial.println(cmd.substring(1));
-      }
-      else if (cmd == "SI") {
-        Serial.println("   Nueva sincronización");
-        sendACK("SA");
-        state = WAIT_CONFIG;
-      }
-      if(cmd == "ST"){
-        Serial.println("Iniciando sincronización de TX");
-        sendACK("SA");
-        state = WAIT_TX;
+        sendACK("MA"); Serial.print(" Mensaje: "); Serial.println(cmd.substring(1));
+      } else if (cmd == "SI") {
+        sendACK("SA"); state = WAIT_CONFIG;
+      } else if (cmd == "ST") {
+        sendACK("SA"); state = WAIT_TX;
       }
       break;
-    case WAIT_TX:
-    Serial.println("WAIT_TX");
+
+    case WAIT_TX:                        // esperando Txx
       if (cmd.startsWith("T")) {
         prev_tx = txPower;
         uint8_t tmp_tx;
         if (parseTX(cmd, &tmp_tx)) {
-          Serial.print("   Nuevo TX solicitado - TX: ");
-          Serial.print(tmp_tx);
           sendACK("SA");
-          updateRadioTX(tmp_tx);
-          state = WAIT_SYNCEND;
+          applyRadioTX(tmp_tx);
+          state = WAIT_SYNCEND;          // ahora espera SE
         } else {
-          Serial.println("   Error: formato TX inválido");
+          Serial.println(" Error: formato TX inválido");
         }
-      }else if (cmd == "SI") {
-        Serial.println("   Re-iniciando sincronización");
-        sendACK("SA");
-        state = WAIT_CONFIG;
-      }
-      if(cmd == "ST"){
-        Serial.println("Iniciando sincronización de TX");
-        sendACK("SA");
-        state = WAIT_TX;
-      }
-      if (cmd.startsWith("M")) {
-        sendACK("MA");
-        Serial.print("   Mensaje: ");
-        Serial.println(cmd.substring(1));
-        state = READY;
+      } else if (cmd == "SI") {
+        sendACK("SA"); state = WAIT_CONFIG;
+      } else if (cmd == "ST") {
+        sendACK("SA"); state = WAIT_TX;  // ya estamos en TX
+      } else if (cmd.startsWith("M")) {
+        sendACK("MA"); Serial.print(" Mensaje: "); Serial.println(cmd.substring(1));
       }
       break;
 
@@ -307,10 +267,11 @@ void onReceive(int packetSize) {
       state = WAIT_SYNC;
       break;
   }
-  
+
   Serial.println();
 }
 
+// ----------------- Timeout & mantenimiento -----------------
 void checkTimeout() {
   if ((millis() - lastPacketTime) > TIMEOUT_MS) {
     Serial.println("\n!!! TIMEOUT detectado !!!");
@@ -323,44 +284,47 @@ void checkTimeout() {
   }
 }
 
+void esclavoMaintenanceTick() {
+  static uint32_t lastTick = 0;
+  if (millis() - lastTick > 500) {
+    LoRa.receive(); // asegura volver a RX periódicamente
+    lastTick = millis();
+  }
+}
+
+// ----------------- Setup & Loop -----------------
 void setup() {
   Serial.begin(9600);
   while (!Serial);
   Serial.println("=== ESCLAVO LoRa - Protocolo Sincronización ===");
 
-  if (!init_PMIC()) {
-    Serial.println("Error: Inicialización BQ24195L fallida");
-  } else {
-    Serial.println("OK: BQ24195L inicializado");
-  }
+  if (!init_PMIC()) Serial.println("Aviso: BQ24195L no inicializado o no presente");
+  else              Serial.println("OK: BQ24195L inicializado");
 
   if (!LoRa.begin(868E6)) {
     Serial.println("Error: LoRa init failed");
     while (true);
   }
-
   LoRa.setSyncWord(SYNC_WORD);
   LoRa.setPreambleLength(8);
   LoRa.setCodingRate4(5);
   LoRa.enableCrc();
 
-  updateRadio(spreadingFactor, bandwidth);
-  updateRadioTX(txPower);
+  applyRadioBW_SF(spreadingFactor, bandwidth);
+  applyRadioTX(txPower);
 
   LoRa.onReceive(onReceive);
   LoRa.receive();
-
   lastPacketTime = millis();
-  
-  Serial.print("Config inicial - BW: ");
-  Serial.print(bandwidth);
-  Serial.print(" Hz, SF: ");
-  Serial.println(spreadingFactor);
+
+  Serial.print("Config inicial - BW: "); Serial.print(bandwidth);
+  Serial.print(" Hz, SF: "); Serial.println(spreadingFactor);
   Serial.println("Esperando sincronización...");
   Serial.println("===========================================\n");
 }
 
 void loop() {
   checkTimeout();
+  esclavoMaintenanceTick();
   delay(10);
 }
