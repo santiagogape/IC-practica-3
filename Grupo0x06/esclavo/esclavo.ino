@@ -16,7 +16,7 @@ const uint8_t localAddress  = 0x05;
 const uint8_t masterAddress = 0x06;
 const uint8_t SYNC_WORD     = 0x12;
 
-#define TIMEOUT_MS 15000
+#define TIMEOUT_MS 5000
 
 // Config original segura
 #define ORIGINAL_BW 125000L
@@ -24,15 +24,18 @@ const uint8_t SYNC_WORD     = 0x12;
 #define ORIGINAL_TX 3
 
 // Estado y configuración
-uint32_t lastPacketTime  = 0;
+uint32_t lastPacketTime = 0;
 uint8_t  spreadingFactor = ORIGINAL_SF;
-long     bandwidth       = ORIGINAL_BW;
-uint8_t  txPower         = ORIGINAL_TX;
+long     bandwidth = ORIGINAL_BW;
+uint8_t  txPower = ORIGINAL_TX;
 
 // Copias previas para rollback en timeout
 uint8_t  prev_spreadingFactor = ORIGINAL_SF;
-long     prev_bandwidth       = ORIGINAL_BW;
-uint8_t  prev_tx              = ORIGINAL_TX;
+long     prev_bandwidth = ORIGINAL_BW;
+uint8_t  prev_tx = ORIGINAL_TX;
+uint8_t  best_tx = ORIGINAL_TX;
+long    best_bw = ORIGINAL_BW;
+uint8_t best_sf = ORIGINAL_SF;
 
 uint16_t messageCount = 0;
 
@@ -76,12 +79,12 @@ void applyRadioTX(uint8_t tx) {
 
 void restorePrevConfig() {
   Serial.println(" Restaurando configuración anterior (BW/SF)");
-  applyRadioBW_SF(prev_spreadingFactor, prev_bandwidth);
+  applyRadioBW_SF(best_sf, best_bw);
 }
 
 void restorePrevTX() {
   Serial.println(" Restaurando TX anterior");
-  applyRadioTX(prev_tx);
+  applyRadioTX(best_tx);
 }
 
 void sendACK(const char* outgoing) {
@@ -183,7 +186,7 @@ void onReceive(int packetSize) {
   if (cmd.length() >= 1 && cmd[0] == 'M') {
     sendACK("MA"); // confirma recepción del mensaje de datos
     Serial.print(" Mensaje M: "); Serial.println(cmd.substring(1));
-    // No cambia el estado de la FSM
+    state = READY;
     return;
   }
 
@@ -219,6 +222,9 @@ void onReceive(int packetSize) {
     case WAIT_SYNCEND:                   // esperando SE para cerrar ciclo
       if (cmd == "SE") {
         sendACK("SA");
+        best_tx = txPower;
+        best_sf = spreadingFactor;
+        best_bw = bandwidth;
         state = WAIT_CONFIG;             // listo para siguiente XBWYSF o SI
       } else if (cmd == "SI") {          // reinicio suave
         restorePrevConfig();
@@ -228,7 +234,7 @@ void onReceive(int packetSize) {
       } else if (cmd.startsWith("M")) {  // mensajes libres
         sendACK("MA");
         Serial.print(" Mensaje: "); Serial.println(cmd.substring(1));
-        // state se mantiene o pasa a READY si lo prefieres
+        state = READY;
       }
       break;
 
@@ -273,7 +279,9 @@ void onReceive(int packetSize) {
 
 // ----------------- Timeout & mantenimiento -----------------
 void checkTimeout() {
-  if ((millis() - lastPacketTime) > TIMEOUT_MS) {
+  if (state == READY){
+    esclavoMaintenanceTick();
+  } else if ((millis() - lastPacketTime) > TIMEOUT_MS) {
     Serial.println("\n!!! TIMEOUT detectado !!!");
     Serial.println("Restaurando estado y configuración inicial\n");
     restorePrevConfig();
