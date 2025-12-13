@@ -77,15 +77,17 @@ void applyRadioTX(uint8_t tx) {
   LoRa.receive();
 }
 
+// ---------- Rollback correcto ----------
 void restorePrevConfig() {
   Serial.println(" Restaurando configuración anterior (BW/SF)");
-  applyRadioBW_SF(best_sf, best_bw);
+  applyRadioBW_SF(prev_spreadingFactor, prev_bandwidth); // FIX
 }
 
 void restorePrevTX() {
   Serial.println(" Restaurando TX anterior");
-  applyRadioTX(best_tx);
+  applyRadioTX(prev_tx); // FIX
 }
+
 
 void sendACK(const char* outgoing) {
   uint8_t msgLength = (uint8_t)strlen(outgoing);
@@ -219,24 +221,33 @@ void onReceive(int packetSize) {
       }
       break;
 
-    case WAIT_SYNCEND:                   // esperando SE para cerrar ciclo
-      if (cmd == "SE") {
-        sendACK("SA");
-        best_tx = txPower;
-        best_sf = spreadingFactor;
-        best_bw = bandwidth;
-        state = WAIT_CONFIG;             // listo para siguiente XBWYSF o SI
-      } else if (cmd == "SI") {          // reinicio suave
-        restorePrevConfig();
-        sendACK("SA"); state = WAIT_CONFIG;
-      } else if (cmd == "ST") {          // pasar a TX
-        sendACK("SA"); state = WAIT_TX;
-      } else if (cmd.startsWith("M")) {  // mensajes libres
-        sendACK("MA");
-        Serial.print(" Mensaje: "); Serial.println(cmd.substring(1));
-        state = READY;
-      }
-      break;
+    case WAIT_SYNCEND:
+  if (cmd == "SE") {
+    sendACK("SA");
+
+    // Solo informativo (no usado para rollback)
+    best_tx = txPower;
+    best_sf = spreadingFactor;
+    best_bw = bandwidth;
+
+    state = WAIT_SYNC;   // FIX: estado correcto tras cerrar ciclo
+  }
+  else if (cmd == "SI") {
+    restorePrevConfig();
+    sendACK("SA");
+    state = WAIT_CONFIG;
+  }
+  else if (cmd == "ST") {
+    restorePrevTX();
+    sendACK("SA");
+    state = WAIT_TX;
+  }
+  else if (cmd.startsWith("M")) {
+    sendACK("MA");
+    state = READY;
+  }
+  break;
+
 
     case READY:
       if (cmd.startsWith("M")) {

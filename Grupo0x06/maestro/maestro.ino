@@ -342,6 +342,9 @@ void onReceive(int packetSize) {
     Serial.println("Error: longitud incorrecta"); return;
   }
   if (recipient != localAddress && recipient != 0xFF) {
+    Serial.println("XXXXXXXXXXXXXXXXXXXXXXXXX");
+    Serial.print("X Recipient "); Serial.print(recipient); Serial.print(" sender "); Serial.print(sender); Serial.println("  X");
+    Serial.println("XXXXXXXXXXXXXXXXXXXXXXXXX");
     Serial.println("Mensaje no es para mí"); return;
   }
 
