@@ -16,7 +16,7 @@ const uint8_t localAddress  = 0x05;
 const uint8_t masterAddress = 0x06;
 const uint8_t SYNC_WORD     = 0x12;
 
-#define TIMEOUT_MS 5000
+#define TIMEOUT_MS 10000
 
 // Config original segura
 #define ORIGINAL_BW 125000L

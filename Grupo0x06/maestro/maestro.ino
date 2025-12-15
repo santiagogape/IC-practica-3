@@ -309,6 +309,8 @@ void loop() {
 // Envío de mensaje con cabecera (async, con TxDone)
 // ======================================================
 void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCountRef) {
+  Serial.print("Current config bw "); Serial.print(currentBW); Serial.print(" SF ");Serial.print(currentSF); Serial.print(" TxP ");Serial.println(currentTX);
+  Serial.println();
   while (!LoRa.beginPacket()) { delay(5); }
   LoRa.write(destination);
   LoRa.write(localAddress);
@@ -399,6 +401,7 @@ void onReceive(int packetSize) {
       prev_txpower = currentTX;
 
       LoRa.idle();
+      currentTX= newTX;
       LoRa.setTxPower(newTX, PA_OUTPUT_PA_BOOST_PIN);
       LoRa.receive();
 
@@ -478,10 +481,11 @@ void onReceive(int packetSize) {
         Serial.print("\n>>> Siguiente configuración ("); Serial.print(syncIndex);
         Serial.print("/"); Serial.print(SYNC_TESTS_COUNT); Serial.println(") <<<\n");
         delay(250);
-        long testBW = sync_bw[syncIndex]; uint8_t testSF = sync_sf[syncIndex];
-        snprintf(pendingMsg, sizeof(pendingMsg), "X%ldY%u", testBW, testSF);
-        pendingMsgLen = strlen(pendingMsg); pendingSend = true;
-        protocolPendingState = WAIT_SA_AFTER_CONFIG;
+        
+        // *** CAMBIO CLAVE AQUI: Volver a enviar SI antes de la siguiente prueba ***
+        strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+        protocolPendingState = WAIT_SA_AFTER_SI; // El siguiente paso será esperar el SA de SI
+        Serial.println("Preparando SI para la siguiente iteración.");
       } else {
         Serial.println("\n===========================================");
         Serial.println(">>> SINCRONIZACIÓN COMPLETA <<<");
@@ -533,6 +537,7 @@ void calculateBestTxPower() {
   Serial.println("-------------------------------------------");
   Serial.print(">>> MEJOR TX POWER: "); Serial.println(bestTXCache);
   Serial.println("===========================================\n");
+  LoRa.setTxPower(bestTXCache, PA_OUTPUT_PA_BOOST_PIN);
 
   txFinalizationPending = true; // haremos ST -> Tbest -> SE
 
