@@ -1,604 +1,729 @@
-/* ---------------------------------------------------------------------
- *  Maestro Completo - Sistema de Sincronización Avanzado
- *  Práctica 3 - GII-IoT
- *  
- *  Fases de operación:
- *  1. Sincronización TxPower (mejor RSSI)
- *  2. Sincronización BW/SF (mejor SNR y tiempo)
- *  3. Aplicar mejor configuración
- *  4. Health check periódico
- * ---------------------------------------------------------------------
- */
+/* ------------------------------------------------------------
+ * MAESTRO LoRa - Sincronización completa + Selección óptima
+ * Dirección local: 0x06, destino: 0x05, SyncWord: 0x12
+ * - Handshake robusto (TX y BW/SF)
+ * - Medición de tiempo de transferencia
+ * - Selección automática de mejor configuración
+ * - Mensajería M con ACK "MA"
+ * ------------------------------------------------------------ */
 
 #include <SPI.h>
 #include <LoRa.h>
 #include <Arduino_PMIC.h>
 
-#define TX_LAPSE_MS 1000
-#define MAX_RETRIES 3
-#define TIMEOUT_MS 5000
-#define HEALTH_CHECK_INTERVAL 10000  // Health check cada 10 segundos
+// ---------- Parámetros generales ----------
+const uint8_t localAddress = 0x06;
+uint8_t destination        = 0x05;
+const uint8_t SYNC_WORD    = 0x12;
 
-// NOTA: Ajustar estas variables
-#define LOCALADDRESS 0x06
-#define DESTINATION 0x05
-#define START_TX 2
-#define START_BW 125000
-#define START_SF 7
+#define TX_LAPSE_MS       15000
+#define WAIT_TIMEOUT_MS    2500
 
-const uint8_t sync_txpower[] = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
-const uint8_t SYNC_TX_COUNT = sizeof(sync_txpower) / sizeof(sync_txpower[0]);
+// Config original
+#define ORIGINAL_BW 125000L
+#define ORIGINAL_SF 7
+#define ORIGINAL_TX 3
 
-const long sync_bw[] = { 125000, 250000, 500000, 62500, 41700, 31250, 20800, 15600, 10400, 7800 };
-const uint8_t sync_sf[] = { 7, 7, 7, 8, 9, 10, 11, 12, 12, 12 };
+// ---------- Matrices de prueba ----------
+const uint8_t sync_txpower[] = {2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20};
+const uint8_t SYNC_TX_COUNT  = sizeof(sync_txpower) / sizeof(sync_txpower[0]);
+
+const long    sync_bw[] = {125000, 250000, 500000, 62500, 41700, 31250, 20800, 15600, 10400, 7800};
+const uint8_t sync_sf[] = {7,      7,      7,      8,     9,     10,    11,    12,    12,    12};
 const uint8_t SYNC_TESTS_COUNT = sizeof(sync_bw) / sizeof(sync_bw[0]);
 
-// Estructuras para almacenar resultados
-struct TestResult {
-  uint8_t txPower;
-  int16_t rssi;
-  float snr;
-  bool valid;
-};
-
-struct BwSfResult {
-  long bandwidth;
-  uint8_t spreadingFactor;
-  float snr;
-  uint32_t txTime;
-  bool valid;
-};
-
-TestResult testResults[sizeof(sync_txpower) / sizeof(sync_txpower[0])];
-BwSfResult bwSfResults[sizeof(sync_bw) / sizeof(sync_bw[0])];
-
-// Mejores valores encontrados
-struct BestConfig {
-  uint8_t txPower;
-  long bandwidth;
-  uint8_t spreadingFactor;
-  int16_t rssi;
-  float snr;
-  uint32_t txTime;
-};
-
-BestConfig bestConfig;
-
-volatile uint8_t txIndex = 0;
-volatile uint8_t bwSfIndex = 0;
-volatile uint8_t retryCount = 0;
-volatile bool txDoneFlag = true;
-volatile bool saReceived = false;
-char pendingMsg[50];
-
+// ---------- Estado del protocolo ----------
 enum SyncState {
   IDLE,
-  // Fase 1: TxPower
-  SYNC_START,
-  WAITSA_AFTERST,
-  SEND_T,
-  WAITSA_AFTERT,
-  // Fase 2: BW/SF
-  SEND_BWSF,
-  WAITSA_AFTER_BWSF,
-  // Fase 3: Finalización y Best Config
-  SEND_SE,
+  SENDING,
+  WAIT_SA_AFTER_ST,
+  WAIT_SA_AFTER_TX,
   WAIT_SA_AFTER_SE_TX,
-  SEND_BEST_CONFIG,
-  WAIT_SA_AFTER_BEST,
-  // Fase 4: Health Check
-  HEALTH_CHECK_MODE
+  WAIT_SA_AFTER_SI,
+  WAIT_SA_AFTER_CONFIG,
+  WAIT_SA_AFTER_SE_BWSF
 };
+volatile SyncState syncState = IDLE;
+volatile SyncState protocolPendingState = IDLE;
 
-volatile SyncState syncState;
-volatile uint32_t lastTxTime = 0;
-volatile uint32_t lastHealthCheck = 0;
+enum ProtocolPhase { PHASE_TX_SYNC, PHASE_BWSF_SYNC, PHASE_COMPLETE };
+ProtocolPhase currentPhase = PHASE_TX_SYNC;
 
-// --------------------------------------------------------------------
-// Setup function
-// --------------------------------------------------------------------
+// --------- Variables runtime ----------
+volatile bool txDoneFlag = true;
+static bool transmitting = false;
+static uint32_t tx_begin_ms = 0;
+
+static uint16_t msgCount = 0;
+static uint32_t txInterval_ms = TX_LAPSE_MS;
+
+// Config actual
+long     currentBW = ORIGINAL_BW;
+uint8_t  currentSF = ORIGINAL_SF;
+uint8_t  currentTX = ORIGINAL_TX;
+
+// Índices de prueba
+uint8_t  txIndex   = 0;
+uint8_t  syncIndex = 0;
+
+// Buffers de envío
+char     pendingMsg[50];
+uint8_t  pendingMsgLen = 0;
+volatile bool pendingSend = false;
+
+// Copias previas
+volatile uint8_t prev_spreadingFactor = ORIGINAL_SF;
+volatile long    prev_bandwidth       = ORIGINAL_BW;
+volatile uint8_t prev_txpower         = ORIGINAL_TX;
+
+// ========== ESTRUCTURAS PARA MEDICIÓN ==========
+struct TxTestResult { 
+  uint8_t txpower; 
+  int rssi; 
+  float snr; 
+  float quality; 
+};
+TxTestResult txResults[21];
+uint8_t      txResultsCount = 0;
+uint8_t      bestTxIndex    = 0;
+volatile bool txFinalizationPending = false;
+uint8_t      bestTXCache = ORIGINAL_TX;
+
+// Estructura para resultados BW/SF con medición de tiempo
+struct BwSfTestResult {
+  long bw;
+  uint8_t sf;
+  int rssi;
+  float snr;
+  uint32_t transferTime_ms;  // NUEVO: tiempo de transferencia
+  float quality;
+};
+BwSfTestResult bwsfResults[10];
+uint8_t bwsfResultsCount = 0;
+uint8_t bestBwSfIndex = 0;
+volatile bool bwsfFinalizationPending = false;
+long    bestBW_cache = ORIGINAL_BW;
+uint8_t bestSF_cache = ORIGINAL_SF;
+
+// Medición de tiempo por ciclo BW/SF
+uint32_t cycleStartTime_ms = 0;
+
+// ---------- Soporte QS/SS/RS y Mensajería M ----------
+static volatile bool lastStatusReceived = false;
+static volatile bool lastMAReceived     = false;
+static long         slaveBW_cache       = 0;
+static uint8_t      slaveSF_cache       = 0;
+static uint8_t      slaveTX_cache       = 0;
+
+static uint16_t mMsgId = 0;
+#define M_PAYLOAD_MAX 200
+
+// ---------- Prototipos ----------
+void onReceive(int packetSize);
+void TxFinished();
+void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCount);
+void calculateBestTxPower();
+void calculateBestBwSf();
+bool requestSlaveStatus(uint32_t timeout_ms = 1500);
+bool healToSlaveState(uint32_t timeout_ms = 1500);
+bool verifyAndHealSync(uint32_t timeout_ms = 2000);
+bool sendMReliable(const char* text, uint8_t maxRetries = 3, uint32_t ackTimeout_ms = 1500);
+void enviarM_con_verificacion(const char* texto);
+void maestroMessagingTick();
+
+// ======================================================
+// Setup
+// ======================================================
 void setup() {
   Serial.begin(9600);
   while (!Serial);
+  Serial.println("=== MAESTRO LoRa - Sincronización Optimizada ===");
 
-  Serial.println("=== LoRa Maestro - Sistema Completo de Sincronización ===\n");
-
-  if (!init_PMIC()) {
-    Serial.println("Initilization of BQ24195L failed!");
-  } else {
-    Serial.println("Initilization of BQ24195L succeeded!");
-  }
+  if (!init_PMIC()) Serial.println("Aviso: BQ24195L no inicializado");
+  else              Serial.println("OK: BQ24195L inicializado");
 
   if (!LoRa.begin(868E6)) {
-    Serial.println("LoRa init failed. Check your connections.");
+    Serial.println("Error: LoRa init failed");
     while (true);
   }
 
-  // Configuración inicial
-  LoRa.setSignalBandwidth(START_BW);
-  LoRa.setSpreadingFactor(START_SF);
-  LoRa.setSyncWord(0x12);
+  LoRa.setSyncWord(SYNC_WORD);
   LoRa.setCodingRate4(5);
   LoRa.setPreambleLength(8);
-  LoRa.setTxPower(START_TX, PA_OUTPUT_PA_BOOST_PIN);
+  LoRa.enableCrc();
+
+  LoRa.setSignalBandwidth(currentBW);
+  LoRa.setSpreadingFactor(currentSF);
+  LoRa.setTxPower(currentTX, PA_OUTPUT_PA_BOOST_PIN);
 
   LoRa.onReceive(onReceive);
-  LoRa.receive();
   LoRa.onTxDone(TxFinished);
+  LoRa.receive();
 
-  Serial.println("LoRa init succeeded.\n");
-  
-  // Inicializar arrays
-  for (uint8_t i = 0; i < SYNC_TX_COUNT; i++) {
-    testResults[i].txPower = sync_txpower[i];
-    testResults[i].rssi = 0;
-    testResults[i].snr = 0.0;
-    testResults[i].valid = false;
-  }
-  
-  for (uint8_t i = 0; i < SYNC_TESTS_COUNT; i++) {
-    bwSfResults[i].bandwidth = sync_bw[i];
-    bwSfResults[i].spreadingFactor = sync_sf[i];
-    bwSfResults[i].snr = 0.0;
-    bwSfResults[i].txTime = 0;
-    bwSfResults[i].valid = false;
-  }
-  
-  syncState = IDLE;
+  Serial.print("Config inicial - BW: "); Serial.print(currentBW);
+  Serial.print(" Hz, SF: "); Serial.print(currentSF);
+  Serial.print(", TX: "); Serial.println(currentTX);
+  Serial.println("================================================\n");
 }
 
-// --------------------------------------------------------------------
-// Loop function
-// --------------------------------------------------------------------
+// ======================================================
+// Loop principal
+// ======================================================
 void loop() {
-  static uint32_t lastSendTime_ms = 0;
-  static uint16_t msgCount = 0;
-  static uint32_t txInterval_ms = TX_LAPSE_MS;
-  static uint32_t tx_begin_ms = 0;
-  static bool transmitting = false;
-
-  // Verificar timeout
-  if ((syncState == WAITSA_AFTERST || syncState == WAITSA_AFTERT || 
-       syncState == WAITSA_AFTER_BWSF || syncState == WAIT_SA_AFTER_SE_TX ||
-       syncState == WAIT_SA_AFTER_BEST) 
-      && !saReceived && (millis() - lastTxTime > TIMEOUT_MS)) {
-    
-    Serial.println("TIMEOUT: No se recibió SA");
-    retryCount++;
-    
-    if (retryCount >= MAX_RETRIES) {
-      Serial.print("Máximo de reintentos alcanzado - ");
-      
-      if (syncState == WAITSA_AFTERST) {
-        Serial.println("Abortando");
-        syncState = IDLE;
-      } else if (syncState == WAITSA_AFTERT) {
-        Serial.println("Pasando al siguiente TxPower");
-        txIndex++;
-        syncState = SEND_T;
-      } else if (syncState == WAITSA_AFTER_BWSF) {
-        Serial.println("Pasando al siguiente BW/SF");
-        bwSfIndex++;
-        syncState = SEND_BWSF;
-      } else if (syncState == WAIT_SA_AFTER_SE_TX) {
-        Serial.println("Pasando a calcular mejor config");
-        syncState = SEND_BEST_CONFIG;
-      } else if (syncState == WAIT_SA_AFTER_BEST) {
-        Serial.println("Pasando a Health Check");
-        syncState = HEALTH_CHECK_MODE;
-      }
-      retryCount = 0;
-    } else {
-      Serial.print("Reintento ");
-      Serial.print(retryCount);
-      Serial.print("/");
-      Serial.println(MAX_RETRIES);
-      
-      if (syncState == WAITSA_AFTERST) syncState = IDLE;
-      else if (syncState == WAITSA_AFTERT) syncState = SEND_T;
-      else if (syncState == WAITSA_AFTER_BWSF) syncState = SEND_BWSF;
-      else if (syncState == WAIT_SA_AFTER_SE_TX) syncState = SEND_SE;
-      else if (syncState == WAIT_SA_AFTER_BEST) syncState = SEND_BEST_CONFIG;
-    }
-    
-    transmitting = false;
-    lastSendTime_ms = 0;
-  }
-
-  // FASE 4: HEALTH CHECK MODE
-  if (syncState == HEALTH_CHECK_MODE && !transmitting && 
-      (millis() - lastHealthCheck > HEALTH_CHECK_INTERVAL)) {
-    
-    snprintf(pendingMsg, sizeof(pendingMsg), "HC");
-    
+  // Envío pendiente
+  if (pendingSend && !transmitting) {
     transmitting = true;
-    txDoneFlag = false;
-    tx_begin_ms = millis();
-    lastHealthCheck = millis();
-
-    sendMessage(pendingMsg, uint8_t(strlen(pendingMsg)), msgCount);
-    Serial.println("[Health Check] Enviando HC");
+    txDoneFlag   = false;
+    tx_begin_ms  = millis();
+    sendMessage(pendingMsg, pendingMsgLen, msgCount);
+    Serial.print(">> Enviando: '"); Serial.print(pendingMsg); Serial.println("'");
+    pendingSend = false;
+    syncState   = SENDING;
   }
 
-  // FASE 3: SEND_BEST_CONFIG
-  if (!transmitting && syncState == SEND_BEST_CONFIG && 
-      ((millis() - lastSendTime_ms) > txInterval_ms)) {
-    
-    // Calcular mejor configuración
-    calculateBestConfig();
-    
-    // Aplicar mejor configuración
-    LoRa.setTxPower(bestConfig.txPower, PA_OUTPUT_PA_BOOST_PIN);
-    LoRa.setSignalBandwidth(bestConfig.bandwidth);
-    LoRa.setSpreadingFactor(bestConfig.spreadingFactor);
-    
-    // Enviar configuración al esclavo
-    snprintf(pendingMsg, sizeof(pendingMsg),
-             "BEST:TX%u,BW%ld,SF%u",
-             bestConfig.txPower,
-             bestConfig.bandwidth,
-             bestConfig.spreadingFactor);
-    
-    Serial.println("\n=== APLICANDO MEJOR CONFIGURACIÓN ===");
-    Serial.print("TxPower: ");
-    Serial.print(bestConfig.txPower);
-    Serial.println(" dBm");
-    Serial.print("Bandwidth: ");
-    Serial.print(bestConfig.bandwidth);
-    Serial.println(" Hz");
-    Serial.print("Spreading Factor: ");
-    Serial.println(bestConfig.spreadingFactor);
-    Serial.print("RSSI: ");
-    Serial.print(bestConfig.rssi);
-    Serial.println(" dBm");
-    Serial.print("SNR: ");
-    Serial.println(bestConfig.snr);
-    Serial.print("Tx Time: ");
-    Serial.print(bestConfig.txTime);
-    Serial.println(" ms");
-    Serial.println("=====================================\n");
-    
-    transmitting = true;
-    txDoneFlag = false;
-    tx_begin_ms = millis();
-    lastTxTime = millis();
-    saReceived = false;
-    
-    sendMessage(pendingMsg, uint8_t(strlen(pendingMsg)), msgCount);
-    syncState = WAIT_SA_AFTER_BEST;
-  }
-
-  // FASE 2: SEND_SE (End of BW/SF tests)
-  if (!transmitting && syncState == SEND_SE && 
-      ((millis() - lastSendTime_ms) > txInterval_ms)) {
-    
-    snprintf(pendingMsg, sizeof(pendingMsg), "SE");
-    
-    transmitting = true;
-    txDoneFlag = false;
-    tx_begin_ms = millis();
-    lastTxTime = millis();
-    saReceived = false;
-
-    sendMessage(pendingMsg, uint8_t(strlen(pendingMsg)), msgCount);
-    Serial.println("\nEnviando SE (fin de pruebas BW/SF)");
-    syncState = WAIT_SA_AFTER_SE_TX;
-  }
-
-  // FASE 2: SEND_BWSF (Bandwidth/Spreading Factor tests)
-  if (!transmitting && syncState == SEND_BWSF && 
-      ((millis() - lastSendTime_ms) > txInterval_ms)) {
-    
-    if (bwSfIndex >= SYNC_TESTS_COUNT) {
-      Serial.println("\n=== Todas las pruebas BW/SF completadas ===\n");
-      bwSfIndex = 0;
-      syncState = SEND_SE;
-      return;
-    }
-    
-    // Aplicar nueva configuración BW/SF
-    snprintf(pendingMsg, sizeof(pendingMsg), 
-             "B%ld,SF%u", 
-             sync_bw[bwSfIndex], 
-             sync_sf[bwSfIndex]);
-    
-    Serial.print("\n[Test BW/SF ");
-    Serial.print(bwSfIndex + 1);
-    Serial.print("/");
-    Serial.print(SYNC_TESTS_COUNT);
-    Serial.print("] BW=");
-    Serial.print(sync_bw[bwSfIndex]);
-    Serial.print(", SF=");
-    Serial.print(sync_sf[bwSfIndex]);
-    Serial.print(" - ");
-    
-    transmitting = true;
-    txDoneFlag = false;
-    tx_begin_ms = millis();
-    lastTxTime = millis();
-    saReceived = false;
-
-    sendMessage(pendingMsg, uint8_t(strlen(pendingMsg)), msgCount);
-    Serial.print("Sending '");
-    Serial.print(pendingMsg);
-    Serial.print("' ");
-    
-    syncState = WAITSA_AFTER_BWSF;
-  }
-
-  // FASE 1: SEND_T (TxPower tests)
-  if (!transmitting && syncState == SEND_T && 
-      ((millis() - lastSendTime_ms) > txInterval_ms)) {
-    
-    if (txIndex >= SYNC_TX_COUNT) {
-      Serial.println("\n=== Todas las pruebas TxPower completadas ===");
-      Serial.println("=== Iniciando pruebas BW/SF ===\n");
-      txIndex = 0;
-      bwSfIndex = 0;
-      syncState = SEND_BWSF;
-      return;
-    }
-    
-    LoRa.setTxPower(sync_txpower[txIndex], PA_OUTPUT_PA_BOOST_PIN);
-    
-    snprintf(pendingMsg, sizeof(pendingMsg), "T%u", sync_txpower[txIndex]);
-    
-    Serial.print("\n[Test TX ");
-    Serial.print(txIndex + 1);
-    Serial.print("/");
-    Serial.print(SYNC_TX_COUNT);
-    Serial.print("] TxPower: ");
-    Serial.print(sync_txpower[txIndex]);
-    Serial.print(" dBm - ");
-    
-    transmitting = true;
-    txDoneFlag = false;
-    tx_begin_ms = millis();
-    lastTxTime = millis();
-    saReceived = false;
-
-    sendMessage(pendingMsg, uint8_t(strlen(pendingMsg)), msgCount);
-    Serial.print("Sending '");
-    Serial.print(pendingMsg);
-    Serial.print("' ");
-    
-    syncState = WAITSA_AFTERT;
-  }
-
-  // FASE 1: IDLE - Iniciar sincronización
-  if (syncState == IDLE && !transmitting && 
-      ((millis() - lastSendTime_ms) > txInterval_ms)) {
-    
-    snprintf(pendingMsg, sizeof(pendingMsg), "ST");
-
-    transmitting = true;
-    txDoneFlag = false;
-    tx_begin_ms = millis();
-    lastTxTime = millis();
-    saReceived = false;
-
-    sendMessage(pendingMsg, uint8_t(strlen(pendingMsg)), msgCount);
-    Serial.println("=== INICIANDO SINCRONIZACIÓN ===");
-    Serial.print("Sending '");
-    Serial.print(pendingMsg);
-    Serial.print("' ");
-    syncState = WAITSA_AFTERST;
-  }
-
-  // Transmisión completada
+  // Fin de TX
   if (transmitting && txDoneFlag) {
     uint32_t TxTime_ms = millis() - tx_begin_ms;
-    Serial.print("----> TX completed in ");
-    Serial.print(TxTime_ms);
-    Serial.println(" msecs");
-    
-    // Guardar tiempo de transmisión para BW/SF
-    if (syncState == WAITSA_AFTER_BWSF) {
-      bwSfResults[bwSfIndex].txTime = TxTime_ms;
+    Serial.print(" TX completado en "); Serial.print(TxTime_ms); Serial.println(" ms");
+
+    if (protocolPendingState != IDLE) {
+      syncState = protocolPendingState;
+      protocolPendingState = IDLE;
     }
-
-    uint32_t lapse_ms = tx_begin_ms - lastSendTime_ms;
-    lastSendTime_ms = tx_begin_ms;
-    float duty_cycle = (100.0f * TxTime_ms) / lapse_ms;
-
-    Serial.print("Duty cycle: ");
-    Serial.print(duty_cycle, 1);
-    Serial.println(" %\n");
-
-    if (duty_cycle <= 1.0f) {
-      txInterval_ms = random(TX_LAPSE_MS) + 1000;
-    } else {
-      txInterval_ms = TxTime_ms * 100;
-    }
-
-    transmitting = false;
     LoRa.receive();
+    transmitting = false;
   }
-}
 
-// --------------------------------------------------------------------
-// Calculate Best Configuration
-// --------------------------------------------------------------------
-void calculateBestConfig() {
-  // Mejor TxPower (mayor RSSI)
-  int8_t bestTxIdx = -1;
-  int16_t bestRSSI = -200;
-  
-  for (uint8_t i = 0; i < SYNC_TX_COUNT; i++) {
-    if (testResults[i].valid && testResults[i].rssi > bestRSSI) {
-      bestRSSI = testResults[i].rssi;
-      bestTxIdx = i;
-    }
+  // Timeouts esperando SA
+  static uint32_t waitStartTime = 0;
+  static SyncState lastStateForTimer = IDLE;
+  if (lastStateForTimer != syncState) {
+    waitStartTime = millis();
+    lastStateForTimer = syncState;
   }
-  
-  // Mejor BW/SF (mejor SNR y menor tiempo)
-  int8_t bestBwSfIdx = -1;
-  float bestScore = -1000.0;
-  
-  for (uint8_t i = 0; i < SYNC_TESTS_COUNT; i++) {
-    if (bwSfResults[i].valid) {
-      // Score = SNR - (txTime/100)
-      // Prioriza SNR alto y tiempo bajo
-      float score = bwSfResults[i].snr - (bwSfResults[i].txTime / 100.0);
-      if (score > bestScore) {
-        bestScore = score;
-        bestBwSfIdx = i;
+  if ((syncState == WAIT_SA_AFTER_ST ||
+       syncState == WAIT_SA_AFTER_TX ||
+       syncState == WAIT_SA_AFTER_SE_TX ||
+       syncState == WAIT_SA_AFTER_SI ||
+       syncState == WAIT_SA_AFTER_CONFIG ||
+       syncState == WAIT_SA_AFTER_SE_BWSF) &&
+      (millis() - waitStartTime > WAIT_TIMEOUT_MS)) {
+
+    Serial.println("\n!!! TIMEOUT esperando SA !!!");
+
+    if (currentPhase == PHASE_TX_SYNC) {
+      if (txFinalizationPending) {
+        Serial.println("Timeout en FINALIZACIÓN TX: reintentando");
+        if (syncState == WAIT_SA_AFTER_ST) {
+          strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
+        } else if (syncState == WAIT_SA_AFTER_TX) {
+          snprintf(pendingMsg, sizeof(pendingMsg), "T%u", bestTXCache);
+          pendingMsgLen = strlen(pendingMsg); pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_TX; syncState = IDLE;
+        } else if (syncState == WAIT_SA_AFTER_SE_TX) {
+          strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_SE_TX; syncState = IDLE;
+        }
+        LoRa.receive();
+      } else {
+        Serial.println("Avanzando a siguiente TX...\n");
+        LoRa.idle();
+        LoRa.setTxPower(prev_txpower, PA_OUTPUT_PA_BOOST_PIN);
+        LoRa.receive();
+        currentTX = prev_txpower;
+
+        txIndex++;
+        if (txIndex < SYNC_TX_COUNT) {
+          delay(300);
+          strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
+        } else {
+          if (txResultsCount == 0) {
+            Serial.println("\n!!! Sin resultados TX, reiniciando !!!\n");
+            LoRa.idle();
+            LoRa.setSignalBandwidth(ORIGINAL_BW);
+            LoRa.setSpreadingFactor(ORIGINAL_SF);
+            LoRa.setTxPower(ORIGINAL_TX, PA_OUTPUT_PA_BOOST_PIN);
+            LoRa.receive();
+            currentBW = ORIGINAL_BW; currentSF = ORIGINAL_SF; currentTX = ORIGINAL_TX;
+            txIndex = 0; syncIndex = 0; currentPhase = PHASE_TX_SYNC;
+            syncState = IDLE; protocolPendingState = IDLE;
+            delay(500);
+          } else {
+            calculateBestTxPower();
+          }
+        }
+      }
+    } else if (currentPhase == PHASE_BWSF_SYNC) {
+      if (bwsfFinalizationPending) {
+        Serial.println("Timeout en FINALIZACIÓN BW/SF: reintentando");
+        if (syncState == WAIT_SA_AFTER_SI) {
+          strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
+        } else if (syncState == WAIT_SA_AFTER_CONFIG) {
+          snprintf(pendingMsg, sizeof(pendingMsg), "X%ldY%u", bestBW_cache, bestSF_cache);
+          pendingMsgLen = strlen(pendingMsg); pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_CONFIG; syncState = IDLE;
+        } else if (syncState == WAIT_SA_AFTER_SE_BWSF) {
+          strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_SE_BWSF; syncState = IDLE;
+        }
+        LoRa.receive();
+      } else {
+        Serial.println("Timeout en BW/SF, avanzar...\n");
+        LoRa.idle();
+        LoRa.setSignalBandwidth(prev_bandwidth);
+        LoRa.setSpreadingFactor(prev_spreadingFactor);
+        LoRa.receive();
+        currentBW = prev_bandwidth;
+        currentSF = prev_spreadingFactor;
+
+        syncIndex++;
+        if (syncIndex < SYNC_TESTS_COUNT) {
+          delay(300);
+          strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
+        } else {
+          if (bwsfResultsCount == 0) {
+            Serial.println("\n!!! Sin resultados BW/SF !!!\n");
+            currentPhase = PHASE_COMPLETE; syncState = IDLE;
+          } else {
+            calculateBestBwSf();
+          }
+        }
       }
     }
   }
-  
-  // Asignar mejor configuración
-  if (bestTxIdx >= 0) {
-    bestConfig.txPower = testResults[bestTxIdx].txPower;
-    bestConfig.rssi = testResults[bestTxIdx].rssi;
-  } else {
-    bestConfig.txPower = START_TX;
-    bestConfig.rssi = 0;
+
+  // Arranque automático
+  static bool protocolStarted = false;
+  if (!protocolStarted && syncState == IDLE && !transmitting) {
+    if (currentPhase == PHASE_TX_SYNC) {
+      Serial.println("\n>>> FASE 1: Sincronización TX <<<\n");
+      strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
+      protocolPendingState = WAIT_SA_AFTER_ST; protocolStarted = true;
+    } else if (currentPhase == PHASE_BWSF_SYNC) {
+      Serial.println("\n>>> FASE 2: Sincronización BW/SF <<<\n");
+      strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+      protocolPendingState = WAIT_SA_AFTER_SI; protocolStarted = true;
+    }
   }
-  
-  if (bestBwSfIdx >= 0) {
-    bestConfig.bandwidth = bwSfResults[bestBwSfIdx].bandwidth;
-    bestConfig.spreadingFactor = bwSfResults[bestBwSfIdx].spreadingFactor;
-    bestConfig.snr = bwSfResults[bestBwSfIdx].snr;
-    bestConfig.txTime = bwSfResults[bestBwSfIdx].txTime;
-  } else {
-    bestConfig.bandwidth = START_BW;
-    bestConfig.spreadingFactor = START_SF;
-    bestConfig.snr = 0.0;
-    bestConfig.txTime = 0;
-  }
+
+  maestroMessagingTick();
+  delay(10);
 }
 
-// --------------------------------------------------------------------
-// Sending message function
-// --------------------------------------------------------------------
-void sendMessage(char* outgoing, uint8_t msgLength, uint16_t& msgCount) {
-  while (!LoRa.beginPacket()) {
-    delay(10);
-  }
-  LoRa.write(DESTINATION);
-  LoRa.write(LOCALADDRESS);
-  LoRa.write((uint8_t)(msgCount >> 7));
-  LoRa.write((uint8_t)(msgCount & 0xFF));
+// ======================================================
+// Envío de mensaje
+// ======================================================
+void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCountRef) {
+  while (!LoRa.beginPacket()) { delay(5); }
+  LoRa.write(destination);
+  LoRa.write(localAddress);
+  LoRa.write((uint8_t)(msgCountRef >> 8));
+  LoRa.write((uint8_t)(msgCountRef & 0xFF));
   LoRa.write(msgLength);
   LoRa.print(outgoing);
   LoRa.endPacket(true);
-  msgCount++;
+  msgCountRef++;
 }
 
-// --------------------------------------------------------------------
-// Receiving message function
-// --------------------------------------------------------------------
+// ======================================================
+// onReceive: procesamiento mejorado con medición de tiempo
+// ======================================================
 void onReceive(int packetSize) {
   if (packetSize == 0) return;
 
-  char buffer[50];
-  int recipient = LoRa.read();
-  uint8_t sender = LoRa.read();
-  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 7) | (uint16_t)LoRa.read();
+  char buffer[60];
+  uint8_t recipient = LoRa.read();
+  uint8_t sender    = LoRa.read();
+  uint16_t incomingMsgId = ((uint16_t)LoRa.read() << 8) | (uint16_t)LoRa.read();
   uint8_t incomingLength = LoRa.read();
 
   uint8_t receivedBytes = 0;
-  while (LoRa.available() && (receivedBytes < uint8_t(sizeof(buffer) - 1))) {
+  while (LoRa.available() && (receivedBytes < sizeof(buffer)-1)) {
     buffer[receivedBytes++] = (char)LoRa.read();
   }
   buffer[receivedBytes] = '\0';
 
-  if (incomingLength != receivedBytes) {
-    Serial.print("Error: length mismatch ");
-    Serial.print(incomingLength);
-    Serial.print(" vs ");
-    Serial.println(receivedBytes);
+  if (incomingLength != receivedBytes || (recipient != localAddress && recipient != 0xFF)) {
     return;
   }
 
-  if ((recipient & LOCALADDRESS) != LOCALADDRESS) {
-    return;
-  }
+  int   rssi = LoRa.packetRssi();
+  float snr  = LoRa.packetSnr();
+  Serial.print("<< Recibido: '"); Serial.print(buffer);
+  Serial.print("'  RSSI: "); Serial.print(rssi);
+  Serial.print(" dBm  SNR: "); Serial.println(snr);
 
-  int16_t rssi = LoRa.packetRssi();
-  float snr = LoRa.packetSnr();
-
-  // Health Check Response
-  if (strcmp(buffer, "HCR") == 0 && syncState == HEALTH_CHECK_MODE) {
-    Serial.print("[Health Check] Respuesta recibida - RSSI: ");
-    Serial.print(rssi);
-    Serial.print(" dBm, SNR: ");
-    Serial.println(snr);
-    return;
-  }
-
-  // SA Response
-  if (strcmp(buffer, "SA") == 0) {
-    saReceived = true;
-    Serial.println("SA recibido");
-    Serial.print("RSSI: ");
-    Serial.print(rssi);
-    Serial.print(" dBm, SNR: ");
-    Serial.println(snr);
-    
-    if (syncState == WAITSA_AFTERST) {
-      syncState = SEND_T;
-      retryCount = 0;
-      txIndex = 0;
-      Serial.println("\n=== Iniciando pruebas TxPower ===\n");
-    } 
-    else if (syncState == WAITSA_AFTERT) {
-      testResults[txIndex].rssi = rssi;
-      testResults[txIndex].snr = snr;
-      testResults[txIndex].valid = true;
-      
-      Serial.print("Guardado [");
-      Serial.print(txIndex);
-      Serial.print("]: TX=");
-      Serial.print(testResults[txIndex].txPower);
-      Serial.print(", RSSI=");
-      Serial.print(rssi);
-      Serial.print(", SNR=");
-      Serial.println(snr);
-      
-      
-      txIndex++;
-      syncState = SEND_T;
-      retryCount = 0;
+  // Captura SS y MA
+  if (receivedBytes >= 2 && buffer[0] == 'S' && buffer[1] == 'S') {
+    String s = String(buffer);
+    int ixX = s.indexOf('X');
+    int ixY = s.indexOf('Y');
+    int ixT = s.indexOf('T');
+    if (ixX >= 2 && ixY > ixX && ixT > ixY) {
+      slaveBW_cache = s.substring(ixX + 1, ixY).toInt();
+      slaveSF_cache = (uint8_t)s.substring(ixY + 1, ixT).toInt();
+      slaveTX_cache = (uint8_t)s.substring(ixT + 1).toInt();
+      lastStatusReceived = true;
     }
-    else if (syncState == WAITSA_AFTER_BWSF) {
-      bwSfResults[bwSfIndex].snr = snr;
-      bwSfResults[bwSfIndex].valid = true;
-      
-      Serial.print("Guardado [");
-      Serial.print(bwSfIndex);
-      Serial.print("]: BW=");
-      Serial.print(bwSfResults[bwSfIndex].bandwidth);
-      Serial.print(", SF=");
-      Serial.print(bwSfResults[bwSfIndex].spreadingFactor);
-      Serial.print(", SNR=");
-      Serial.print(snr);
-      Serial.print(", Time=");
-      Serial.print(bwSfResults[bwSfIndex].txTime);
-      Serial.println(" ms");
-      LoRa.setSignalBandwidth(sync_bw[bwSfIndex]);
-      LoRa.setSpreadingFactor(sync_sf[bwSfIndex]);
-      
-      bwSfIndex++;
-      syncState = SEND_BWSF;
-      retryCount = 0;
+  }
+  if (receivedBytes >= 2 && buffer[0] == 'M' && buffer[1] == 'A') {
+    lastMAReceived = true;
+  }
+
+  // Sólo procesamos SA
+  if (!(receivedBytes >= 2 && buffer[0] == 'S' && buffer[1] == 'A')) {
+    return;
+  }
+  Serial.println(" SA recibido");
+
+  // ===== FASE TX POWER =====
+  if (currentPhase == PHASE_TX_SYNC) {
+    if (syncState == WAIT_SA_AFTER_ST) {
+      uint8_t txToSend = txFinalizationPending ? bestTXCache : sync_txpower[txIndex];
+      snprintf(pendingMsg, sizeof(pendingMsg), "T%u", txToSend);
+      pendingMsgLen = strlen(pendingMsg); pendingSend = true;
+      protocolPendingState = WAIT_SA_AFTER_TX;
+    }
+    else if (syncState == WAIT_SA_AFTER_TX) {
+      uint8_t newTX = txFinalizationPending ? bestTXCache : sync_txpower[txIndex];
+      prev_txpower = currentTX;
+      LoRa.idle();
+      currentTX = newTX;
+      LoRa.setTxPower(newTX, PA_OUTPUT_PA_BOOST_PIN);
+      LoRa.receive();
+      delay(80);
+
+      strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
+      protocolPendingState = WAIT_SA_AFTER_SE_TX;
     }
     else if (syncState == WAIT_SA_AFTER_SE_TX) {
-      Serial.println("SA recibido - Pruebas BW/SF finalizadas");
-      syncState = SEND_BEST_CONFIG;
-      retryCount = 0;
+      if (txFinalizationPending) {
+        Serial.println(" Ciclo TX FINAL completado -> pasar a BW/SF\n");
+        txFinalizationPending = false;
+        currentPhase = PHASE_BWSF_SYNC;
+        strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+        protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
+      } else {
+        txResults[txResultsCount].txpower = currentTX;
+        txResults[txResultsCount].rssi    = rssi;
+        txResults[txResultsCount].snr     = snr;
+        txResults[txResultsCount].quality = snr * 2.0 + (rssi + 100) * 0.5;
+        txResultsCount++;
+        txIndex++;
+
+        if (txIndex < SYNC_TX_COUNT) {
+          delay(250);
+          strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
+        } else {
+          calculateBestTxPower();
+        }
+      }
     }
-    else if (syncState == WAIT_SA_AFTER_BEST) {
-      Serial.println("\n=== CONFIGURACIÓN APLICADA ===");
-      Serial.println("=== Entrando en modo Health Check ===\n");
-      syncState = HEALTH_CHECK_MODE;
-      lastHealthCheck = millis();
-      retryCount = 0;
+  }
+
+  // ===== FASE BW/SF CON MEDICIÓN DE TIEMPO =====
+  if (currentPhase == PHASE_BWSF_SYNC) {
+    if (syncState == WAIT_SA_AFTER_SI) {
+      long testBW = bwsfFinalizationPending ? bestBW_cache : sync_bw[syncIndex];
+      uint8_t testSF = bwsfFinalizationPending ? bestSF_cache : sync_sf[syncIndex];
+      
+      snprintf(pendingMsg, sizeof(pendingMsg), "X%ldY%u", testBW, testSF);
+      pendingMsgLen = strlen(pendingMsg); pendingSend = true;
+      protocolPendingState = WAIT_SA_AFTER_CONFIG;
+      
+      // INICIO de medición de tiempo del ciclo
+      cycleStartTime_ms = millis();
+    }
+    else if (syncState == WAIT_SA_AFTER_CONFIG) {
+      long newBW = bwsfFinalizationPending ? bestBW_cache : sync_bw[syncIndex];
+      uint8_t newSF = bwsfFinalizationPending ? bestSF_cache : sync_sf[syncIndex];
+
+      LoRa.idle();
+      LoRa.setSignalBandwidth(newBW);
+      LoRa.setSpreadingFactor(newSF);
+      LoRa.receive();
+
+      prev_spreadingFactor = currentSF;
+      prev_bandwidth       = currentBW;
+      currentBW = newBW; currentSF = newSF;
+
+      delay(80);
+      strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
+      protocolPendingState = WAIT_SA_AFTER_SE_BWSF;
+    }
+    else if (syncState == WAIT_SA_AFTER_SE_BWSF) {
+      // FIN de medición: calcular tiempo total del ciclo
+      uint32_t cycleTime = millis() - cycleStartTime_ms;
+      
+      if (bwsfFinalizationPending) {
+        Serial.println(" Ciclo BW/SF FINAL completado!");
+        Serial.println("\n===========================================");
+        Serial.println(">>> SINCRONIZACIÓN COMPLETA <<<");
+        Serial.print(">>> Config óptima: BW="); Serial.print(currentBW);
+        Serial.print(" Hz, SF="); Serial.print(currentSF);
+        Serial.print(", TX="); Serial.println(currentTX);
+        Serial.println("===========================================\n");
+        
+        bwsfFinalizationPending = false;
+        currentPhase = PHASE_COMPLETE; syncState = IDLE;
+        protocolPendingState = IDLE; pendingSend = false;
+      } else {
+        Serial.print(" Ciclo completado en "); 
+        Serial.print(cycleTime); 
+        Serial.println(" ms");
+        
+        bwsfResults[bwsfResultsCount].bw = currentBW;
+        bwsfResults[bwsfResultsCount].sf = currentSF;
+        bwsfResults[bwsfResultsCount].rssi = rssi;
+        bwsfResults[bwsfResultsCount].snr = snr;
+        bwsfResults[bwsfResultsCount].transferTime_ms = cycleTime;
+        bwsfResults[bwsfResultsCount].quality = snr * 2.0 + (rssi + 100) * 0.5;
+        bwsfResultsCount++;
+        
+        syncIndex++;
+        if (syncIndex < SYNC_TESTS_COUNT) {
+          delay(250);
+          strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+          protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
+        } else {
+          calculateBestBwSf();
+        }
+      }
     }
   }
 }
 
-void TxFinished() {
-  txDoneFlag = true;
+void TxFinished() { txDoneFlag = true; }
+
+// ======================================================
+// Cálculo de mejor TX
+// ======================================================
+void calculateBestTxPower() {
+  Serial.println("\n===========================================");
+  Serial.println(">>> Análisis TX Power <<<");
+  Serial.println("===========================================");
+
+  if (txResultsCount == 0) {
+    Serial.println("Sin resultados TX\n");
+    LoRa.idle();
+    LoRa.setSignalBandwidth(ORIGINAL_BW);
+    LoRa.setSpreadingFactor(ORIGINAL_SF);
+    LoRa.setTxPower(ORIGINAL_TX, PA_OUTPUT_PA_BOOST_PIN);
+    LoRa.receive();
+    currentBW = ORIGINAL_BW; currentSF = ORIGINAL_SF; currentTX = ORIGINAL_TX;
+    txIndex = 0; syncIndex = 0; currentPhase = PHASE_TX_SYNC;
+    syncState = IDLE; protocolPendingState = IDLE;
+    delay(500);
+    return;
+  }
+
+  float bestQuality = txResults[0].quality; bestTxIndex = 0;
+  for (uint8_t i = 0; i < txResultsCount; i++) {
+    Serial.print("TX="); Serial.print(txResults[i].txpower);
+    Serial.print(" RSSI="); Serial.print(txResults[i].rssi);
+    Serial.print(" SNR=");  Serial.print(txResults[i].snr);
+    Serial.print(" Calidad="); Serial.println(txResults[i].quality);
+    if (txResults[i].quality > bestQuality) { 
+      bestQuality = txResults[i].quality; 
+      bestTxIndex = i; 
+    }
+  }
+
+  bestTXCache = txResults[bestTxIndex].txpower;
+  Serial.println("-------------------------------------------");
+  Serial.print(">>> MEJOR TX POWER: "); Serial.println(bestTXCache);
+  Serial.println("===========================================\n");
+
+  txFinalizationPending = true;
+  strcpy(pendingMsg, "ST");
+  pendingMsgLen = 2; pendingSend = true;
+  protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
+}
+
+// ======================================================
+// NUEVO: Cálculo de mejor BW/SF basado en menor tiempo
+// ======================================================
+void calculateBestBwSf() {
+  Serial.println("\n===========================================");
+  Serial.println(">>> Análisis BW/SF (Tiempo de Transferencia) <<<");
+  Serial.println("===========================================");
+
+  if (bwsfResultsCount == 0) {
+    Serial.println("Sin resultados BW/SF\n");
+    currentPhase = PHASE_COMPLETE; syncState = IDLE;
+    return;
+  }
+
+  // Buscar la configuración con MENOR tiempo de transferencia
+  uint32_t bestTime = bwsfResults[0].transferTime_ms;
+  bestBwSfIndex = 0;
+  
+  for (uint8_t i = 0; i < bwsfResultsCount; i++) {
+    Serial.print("BW="); Serial.print(bwsfResults[i].bw);
+    Serial.print(" Hz, SF="); Serial.print(bwsfResults[i].sf);
+    Serial.print(" | Tiempo="); Serial.print(bwsfResults[i].transferTime_ms);
+    Serial.print(" ms | RSSI="); Serial.print(bwsfResults[i].rssi);
+    Serial.print(" dBm, SNR="); Serial.print(bwsfResults[i].snr);
+    Serial.print(" | Calidad="); Serial.println(bwsfResults[i].quality);
+    
+    // Priorizar MENOR tiempo
+    if (bwsfResults[i].transferTime_ms < bestTime) {
+      bestTime = bwsfResults[i].transferTime_ms;
+      bestBwSfIndex = i;
+    }
+  }
+
+  bestBW_cache = bwsfResults[bestBwSfIndex].bw;
+  bestSF_cache = bwsfResults[bestBwSfIndex].sf;
+  
+  Serial.println("-------------------------------------------");
+  Serial.print(">>> MEJOR CONFIG (menor tiempo): BW=");
+  Serial.print(bestBW_cache);
+  Serial.print(" Hz, SF="); Serial.print(bestSF_cache);
+  Serial.print(" | Tiempo="); Serial.print(bestTime);
+  Serial.println(" ms");
+  Serial.println("===========================================\n");
+
+  bwsfFinalizationPending = true;
+  strcpy(pendingMsg, "SI");
+  pendingMsgLen = 2; pendingSend = true;
+  protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
+}
+
+// ======================================================
+// Funciones QS/SS/RS y Mensajería M
+// ======================================================
+bool requestSlaveStatus(uint32_t timeout_ms) {
+  lastStatusReceived = false;
+  while (!LoRa.beginPacket()) { delay(5); }
+  LoRa.write(destination); LoRa.write(localAddress);
+  LoRa.write((uint8_t)0);  LoRa.write((uint8_t)0);
+  LoRa.write((uint8_t)2);  LoRa.print("QS");
+  LoRa.endPacket(true);
+
+  uint32_t t0 = millis();
+  while (!lastStatusReceived && (millis() - t0) < timeout_ms) {
+    LoRa.receive(); delay(10);
+  }
+  return lastStatusReceived;
+}
+
+bool healToSlaveState(uint32_t timeout_ms) {
+  bool changed = false;
+  if (slaveTX_cache != 0 && slaveTX_cache != currentTX) {
+    Serial.print("Curación: MAESTRO -> TX="); Serial.println(slaveTX_cache);
+    LoRa.idle(); LoRa.setTxPower(slaveTX_cache, PA_OUTPUT_PA_BOOST_PIN); LoRa.receive();
+    currentTX = slaveTX_cache; changed = true; delay(60);
+  }
+  if ((slaveBW_cache != 0 && slaveBW_cache != currentBW) ||
+      (slaveSF_cache != 0 && slaveSF_cache != currentSF)) {
+    Serial.print("Curación: MAESTRO -> BW="); Serial.print(slaveBW_cache);
+    Serial.print(" SF="); Serial.println(slaveSF_cache);
+    LoRa.idle(); LoRa.setSignalBandwidth(slaveBW_cache); LoRa.setSpreadingFactor(slaveSF_cache); LoRa.receive();
+    currentBW = slaveBW_cache; currentSF = slaveSF_cache; changed = true; delay(60);
+  }
+  if (changed) {
+    while (!LoRa.beginPacket()) { delay(5); }
+    LoRa.write(destination); LoRa.write(localAddress);
+    LoRa.write((uint8_t)0); LoRa.write((uint8_t)0);
+    LoRa.write((uint8_t)2); LoRa.print("SE");
+    LoRa.endPacket(true);
+    uint32_t t0 = millis();
+    while ((millis() - t0) < timeout_ms) { LoRa.receive(); delay(10); break; }
+    return true;
+  }
+  return true;
+}
+
+bool verifyAndHealSync(uint32_t timeout_ms) {
+  Serial.println("Verificando sincronización con QS...");
+  if (!requestSlaveStatus(timeout_ms)) {
+    Serial.println("QS sin respuesta; enviando RS...");
+    while (!LoRa.beginPacket()) { delay(5); }
+    LoRa.write(destination); LoRa.write(localAddress);
+    LoRa.write((uint8_t)0);  LoRa.write((uint8_t)0);
+    LoRa.write((uint8_t)2);  LoRa.print("RS");
+    LoRa.endPacket(true);
+    delay(200);
+    if (!requestSlaveStatus(timeout_ms)) {
+      Serial.println("Sin estado tras RS; abortando envío de M.");
+      return false;
+    }
+  }
+  bool okBW = (slaveBW_cache == currentBW);
+  bool okSF = (slaveSF_cache == currentSF);
+  bool okTX = (slaveTX_cache == currentTX);
+  if (okBW && okSF && okTX) {
+    Serial.println("Sincronización OK (BW/SF/TX iguales).");
+    return true;
+  }
+  Serial.println("Diferencias detectadas; curando maestro al estado del esclavo...");
+  return healToSlaveState(timeout_ms);
+}
+
+bool sendMReliable(const char* text, uint8_t maxRetries, uint32_t ackTimeout_ms) {
+  if (!text) return false;
+  char payload[M_PAYLOAD_MAX + 2];
+  payload[0] = 'M';
+  size_t tlen = strlen(text);
+  if (tlen > M_PAYLOAD_MAX) tlen = M_PAYLOAD_MAX;
+  memcpy(&payload[1], text, tlen);
+  payload[1 + tlen] = '\0';
+  uint8_t msgLength = (uint8_t)(1 + tlen);
+
+  for (uint8_t attempt = 0; attempt <= maxRetries; ++attempt) {
+    lastMAReceived = false;
+    while (!LoRa.beginPacket()) { delay(5); }
+    LoRa.write(destination); LoRa.write(localAddress);
+    LoRa.write((uint8_t)(mMsgId >> 8));
+    LoRa.write((uint8_t)(mMsgId & 0xFF));
+    LoRa.write(msgLength);
+    LoRa.print(payload);
+    LoRa.endPacket(true);
+
+    Serial.print(">> Enviando M (intento ");
+    Serial.print(attempt + 1); Serial.print("/"); Serial.print(maxRetries + 1);
+    Serial.print("): '"); Serial.print(payload + 1); Serial.println("'");
+
+    uint32_t t0 = millis();
+    while (!lastMAReceived && (millis() - t0) < ackTimeout_ms) { LoRa.receive(); delay(10); }
+    if (lastMAReceived) { 
+      Serial.println("ACK MA recibido. M entregado."); 
+      mMsgId++; 
+      return true; 
+    }
+    Serial.println("Sin ACK MA; reintento...");
+  }
+  Serial.println("Fallo en envío M: sin ACK MA tras reintentos.");
+  return false;
+}
+
+void enviarM_con_verificacion(const char* texto) {
+  if (!verifyAndHealSync(2000)) {
+    Serial.println("Sincronización no válida; no se envía M.");
+    return;
+  }
+  sendMReliable(texto, 3, 1500);
+}
+
+void maestroMessagingTick() {
+  if (currentPhase != PHASE_COMPLETE) return;
+  static char lineBuf[M_PAYLOAD_MAX + 1];
+  static size_t idx = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      lineBuf[idx] = '\0';
+      if (idx > 0) enviarM_con_verificacion(lineBuf);
+      idx = 0;
+      return;
+    }
+    if (idx < M_PAYLOAD_MAX) lineBuf[idx++] = c;
+  }
 }
