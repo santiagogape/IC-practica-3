@@ -1,0 +1,323 @@
+% !TeX program = pdflatex
+\documentclass[11pt,a4paper]{article}
+\usepackage[spanish]{babel}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{geometry}
+\geometry{margin=2.3cm}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{setspace}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning}
+\title{Nuevo Protocolo LoRa}
+\author{}
+\date{\today}
+
+% Estilos
+\tikzset{
+  block/.style = {rectangle, rounded corners, draw, align=center, minimum width=3.4cm, minimum height=0.9cm},
+  decision/.style = {diamond, draw, aspect=2, align=center, inner sep=1pt},
+  line/.style = {->, >=Stealth, thick},
+  lifeline/.style = {dashed, gray},
+  msg/.style = {->, >=Stealth, thick},
+}
+
+\begin{document}
+\maketitle
+\onehalfspacing
+
+\section{Parámetros generales}
+\begin{itemize}
+  \item Tamaño máximo de mensaje en LoRa (SF12): 51~bytes; usaremos 50~bytes para la carga útil del protocolo.
+  \item Frecuencia de operación: 868~MHz (banda ISM europea).
+  \item Duty cycle máximo: 1\% (limitación regulatoria).
+  \item Timeout de sincronización: 120~segundos (2~minutos).
+  \item Timeout de ACK: 3~segundos (configurable según SF/BW).
+  \item Número máximo de reintentos: 3.
+  \item \textbf{Calibración de TxPower:}
+    \begin{itemize}
+      \item Rango de calibración: 3--20~dBm.
+      \item Intervalo entre pruebas: 2~segundos.
+      \item Criterio de selección: mejor SNR (peso 2x) + RSSI + eficiencia energética.
+    \end{itemize}
+\end{itemize}
+
+\section{Formato de la trama}
+La carga útil en LoRa encapsula el siguiente encabezado y mensajes:
+
+\begin{verbatim}
+Byte 0   Byte 1        Byte 2        Byte 3..N
++-------+-------------+-------------+---------------------------
+| Dst   | LocalAddr   | MsgSize     | Payload (mensajes)       |
++-------+-------------+-------------+---------------------------
+\end{verbatim}
+
+\section{Mensajes del protocolo}
+Cabecera mínima de mensaje (dentro de \texttt{Payload}):
+\begin{verbatim}
+Bit:   7   6 5 4 3 2 1   0
+      +---+-------------+---+
+      | X |  Z Z Z Z Z  | Y |
+      +---+-------------+---+
+\end{verbatim}
+\begin{itemize}
+  \item X: rol de origen (1=Master, 0=Slave)
+  \item Z: reservado (6~bits)
+  \item Y: LSB de tipo o flag auxiliar
+\end{itemize}
+\noindent Tipos de mensaje (código en bits 0-3):
+\begin{center}
+\begin{tabular}{|c|l|p{7.5cm}|}
+\hline
+\textbf{Código} & \textbf{Tipo} & \textbf{Descripción} \\
+\hline
+  0x00 & ACK & Confirmación de recepción. Durante calibración incluye RSSI/SNR (5~bytes). \\
+  0x01 & FORBIDDEN & Mensaje rechazado/prohibido (sin payload). \\
+  0x02 & MSG\_SEND & Envío de datos de aplicación (payload ASCII). \\
+  0x03 & SYNC\_CHECK & Verificación de sincronización (sin payload). \\
+  0x04 & SYNC\_ATTEMPT & Sincronización inicial con parámetros de radio. \\
+  0x05 & CALIBRATION & Mensaje de prueba de calibración TxPower. \\
+  0x06 & FINAL\_CONFIG & Configuración óptima tras calibración. \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Message Send}
+Patrón ilustrativo: X0000010. El cuerpo son bytes ASCII de aplicación hasta completar \texttt{MsgSize}.
+
+\subsection{SyncAttempt (sólo Master)}
+Mensaje de sincronización inicial con parámetros de configuración de radio. Formato del payload:
+
+\begin{center}
+\begin{tabular}{|c|c|c|c|}
+\hline
+\textbf{Byte 0-3} & \textbf{Byte 4} & \textbf{Byte 5} & \textbf{Total} \\
+\hline
+Bandwidth (Hz) & Spreading Factor & TxPower (dBm) & 6 bytes \\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Detalles de los campos:}
+\begin{itemize}
+  \item \textbf{Bandwidth (4 bytes):} Ancho de banda en Hz, formato little-endian (uint32).
+    \begin{itemize}
+      \item Valores típicos: 125000, 250000, 500000~Hz.
+      \item Ejemplo: BW=125000 → \texttt{0x40 0xE2 0x01 0x00}.
+    \end{itemize}
+  \item \textbf{Spreading Factor (1 byte):} Factor de dispersión (6--12).
+    \begin{itemize}
+      \item Rango válido: [6, 12].
+      \item Mayor SF → mayor alcance pero menor velocidad.
+    \end{itemize}
+  \item \textbf{TxPower (1 byte):} Potencia de transmisión en dBm (2--20).
+    \begin{itemize}
+      \item Rango válido: [2, 20] dBm.
+      \item Usar valores bajos (2-5 dBm) para pruebas de corta distancia.
+    \end{itemize}
+\end{itemize}
+
+\noindent El esclavo debe actualizar su configuración de radio con estos parámetros al recibir y validar este mensaje.
+
+\subsection{ACK con métricas (durante calibración)}
+Durante la fase de calibración, el esclavo responde con un ACK extendido que incluye las métricas de señal medidas:
+
+\begin{center}
+\begin{tabular}{|c|c|c|c|}
+\hline
+\textbf{Byte 0} & \textbf{Byte 1-2} & \textbf{Byte 3-4} & \textbf{Total} \\
+\hline
+Header (0x00) & RSSI (int16, LE) & SNR$\times$10 (int16, LE) & 5 bytes \\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Detalles:}
+\begin{itemize}
+  \item \textbf{RSSI (2 bytes):} Valor RSSI en dBm como entero con signo (little-endian).
+  \item \textbf{SNR$\times$10 (2 bytes):} Valor SNR multiplicado por 10 para preservar un decimal.
+\end{itemize}
+
+\subsection{CALIBRATION (sólo Master)}
+Mensaje de prueba de calibración de potencia de transmisión:
+
+\begin{center}
+\begin{tabular}{|c|c|c|}
+\hline
+\textbf{Byte 0} & \textbf{Byte 1} & \textbf{Total} \\
+\hline
+Header (0x85) & TxPower (dBm) & 2 bytes \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{FINAL\_CONFIG (sólo Master)}
+Mensaje con la configuración óptima determinada tras la calibración. Mismo formato que SyncAttempt:
+
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+\textbf{Byte 0} & \textbf{Byte 1-4} & \textbf{Byte 5} & \textbf{Byte 6} & \textbf{Total} \\
+\hline
+Header (0x86) & Bandwidth (Hz) & SF & TxPower óptimo & 7 bytes \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Estados y transiciones}
+
+El protocolo define tres estados principales para cada nodo:
+
+\begin{center}
+\begin{tabular}{|l|p{9cm}|}
+\hline
+\textbf{Estado} & \textbf{Descripción} \\
+\hline
+\texttt{SYNC} & Estado de sincronización inicial. El maestro envía SyncAttempt y espera confirmación. \\
+\hline
+\texttt{CALIBRATING} & Estado de calibración de TxPower. El maestro prueba valores de 3 a 20~dBm y el esclavo responde con métricas RSSI/SNR. \\
+\hline
+\texttt{DATA} & Estado operacional. Se intercambian mensajes de datos (MSG\_SEND) con confirmación (ACK). \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Transiciones de estado}
+\begin{itemize}
+  \item \texttt{SYNC $\rightarrow$ CALIBRATING}: Tras recibir ACK de SyncAttempt.
+  \item \texttt{CALIBRATING $\rightarrow$ DATA}: Tras completar calibración y enviar/recibir FINAL\_CONFIG.
+  \item \texttt{DATA $\rightarrow$ SYNC}: Si transcurren 2 minutos sin recibir mensajes válidos (timeout de sincronización).
+  \item \texttt{SYNC $\rightarrow$ SYNC}: Reintentos de sincronización (hasta 3 intentos por defecto).
+\end{itemize}
+
+\subsection{Proceso de calibración de TxPower}
+El proceso de calibración automática sigue estos pasos:
+\begin{enumerate}
+  \item El maestro inicia con TxPower mínimo (3~dBm).
+  \item Envía mensaje CALIBRATION con el TxPower actual.
+  \item El esclavo responde con ACK incluyendo RSSI y SNR medidos.
+  \item El maestro incrementa TxPower y repite hasta alcanzar 20~dBm.
+  \item Se calcula el TxPower óptimo usando la fórmula:
+    \[ \text{Score} = (\text{SNR} \times 2.0) + (\text{RSSI} + 100) \times 0.5 - (\text{TxPower} - 3) \times 0.1 \]
+  \item El maestro envía FINAL\_CONFIG con el TxPower óptimo.
+  \item Ambos nodos aplican la configuración y transicionan a DATA.
+\end{enumerate}
+
+\section{Diagramas}
+\subsection{Secuencia: sincronización con calibración}
+\begin{center}
+\begin{tikzpicture}[x=1cm,y=1cm]
+  % Lifelines
+  \node (M) at (0,0) {\textbf{Maestro}}; \draw[lifeline] (0,-0.3) -- (0,-14);
+  \node (S) at (8,0) {\textbf{Esclavo}}; \draw[lifeline] (8,-0.3) -- (8,-14);
+
+  % Sync phase
+  \node[left] at (-0.5,-0.8) {\footnotesize\textit{SYNC}};
+  \draw[msg] (0,-1) -- node[above,sloped]{SyncAttempt(BW,SF,TxPower=3)} (8,-1.8);
+  \draw[msg] (8,-2.3) -- node[above,sloped]{Ack + RSSI/SNR} (0,-3.1);
+  
+  % Calibration phase
+  \node[left] at (-0.5,-3.8) {\footnotesize\textit{CALIBRATING}};
+  \draw[msg] (0,-4.2) -- node[above,sloped]{Calibration(TxPower=3)} (8,-5);
+  \draw[msg] (8,-5.5) -- node[above,sloped]{Ack + RSSI/SNR} (0,-6.3);
+  \node at (4,-7) {\footnotesize ... (TxPower 4 a 19) ...};
+  \draw[msg] (0,-7.7) -- node[above,sloped]{Calibration(TxPower=20)} (8,-8.5);
+  \draw[msg] (8,-9) -- node[above,sloped]{Ack + RSSI/SNR} (0,-9.8);
+  
+  % Final config
+  \draw[msg] (0,-10.5) -- node[above,sloped]{FinalConfig(BW,SF,TxPower\_óptimo)} (8,-11.3);
+  \draw[msg] (8,-11.8) -- node[above,sloped]{Ack} (0,-12.6);
+  
+  % Data phase
+  \node[left] at (-0.5,-13.2) {\footnotesize\textit{DATA}};
+\end{tikzpicture}
+\end{center}
+
+\subsection{Secuencia: SyncAttempt no satisfactorio}
+\begin{center}
+\begin{tikzpicture}[x=1cm,y=1cm]
+  % Lifelines
+  \node (M2) at (0,0) {\textbf{Maestro}}; \draw[lifeline] (0,-0.3) -- (0,-9.5);
+  \node (S2) at (8,0) {\textbf{Esclavo}}; \draw[lifeline] (8,-0.3) -- (8,-9.5);
+
+  % Messages
+  \draw[msg] (0,-1) -- node[above,sloped]{SyncAttempt(BW,SF,TxPower)} (8,-2);
+  % No Ack (cruz)
+  \draw[red, very thick] (4,-2.3) -- (4.8,-3.1);
+  \draw[red, very thick] (4.8,-2.3) -- (4,-3.1);
+  \node[red] at (5.2,-2.7) {(sin Ack)};
+
+  \draw[msg] (8,-4) -- node[above,sloped]{SyncCheck} (0,-5);
+  \draw[msg] (0,-6) -- node[above,sloped]{Ack} (8,-7);
+  \node at (4,-8.2) {Si no hay Ack tras SyncCheck: \textit{Rollback} en el esclavo};
+\end{tikzpicture}
+\end{center}
+
+\subsection{Flujo: Sync Restart (cada 2 min)}
+\begin{center}
+\begin{tikzpicture}[node distance=2.2cm]
+  \node[block] (start) {Inicio};
+  \node[decision, below=of start] (t) {¿Han pasado 2 min sin mensajes?};
+  \node[block, below=of t] (check) {Ambos ejecutan\\SyncCheck};
+  \node[decision, below=of check] (ok) {¿Sincronía correcta?};
+  \node[block, below=of ok] (fb) {Fallback a SF/BW conocidos};
+  \node[block, below=of fb] (attempt) {Maestro envía SyncAttempt};
+  \node[decision, below=of attempt] (ack) {¿Recibe Ack?};
+  \node[block, below=of ack] (end) {Fin};
+  \node[block, left=3.6cm of ack] (diag) {Reintentar / Diagnóstico\\(Rollback si procede)};
+
+  \draw[line] (start) -- (t);
+  \draw[line] (t) -- node[right]{Sí} (check);
+  \draw[line] (t.west) -| node[near start, left]{No} (start.west);
+  \draw[line] (check) -- (ok);
+  \draw[line] (ok) -- node[right]{No} (fb);
+  \draw[line] (ok.east) -| node[near start, right]{Sí} (start.east);
+  \draw[line] (fb) -- (attempt);
+  \draw[line] (attempt) -- (ack);
+  \draw[line] (ack) -- node[right]{Sí} (end);
+  \draw[line] (ack) -- node[above]{No} (diag);
+  \draw[line] (diag) |- (fb);
+\end{tikzpicture}
+\end{center}
+
+\section{Criterios de aceptación}
+\begin{itemize}
+  \item Ack tras SyncAttempt $\Rightarrow$ transición a estado CALIBRATING.
+  \item La calibración debe probar todos los valores de TxPower de 3 a 20~dBm.
+  \item El ACK durante calibración debe incluir RSSI y SNR medidos por el receptor.
+  \item El TxPower óptimo se selecciona maximizando la función de score.
+  \item Ack tras FINAL\_CONFIG $\Rightarrow$ transición a estado DATA.
+  \item En MSG\_SEND, tamaño total del payload $\leq$ 50~bytes y contenido ASCII válido.
+  \item Tras Sync Restart, ambos nodos permanecen en el par (SF, BW, TxPower) acordado.
+  \item Los parámetros de SyncAttempt deben ser validados:
+    \begin{itemize}
+      \item BW $\in$ \{125000, 250000, 500000\} Hz.
+      \item SF $\in$ [6, 12].
+      \item TxPower $\in$ [2, 20] dBm.
+    \end{itemize}
+  \item El timeout de ACK debe ajustarse dinámicamente según el SF seleccionado (mayor SF requiere mayor timeout).
+  \item Si no se recibe ACK tras 3 intentos, se debe volver al estado SYNC.
+\end{itemize}
+
+\section{Ejemplo de trama SyncAttempt}
+
+Ejemplo con BW=125000~Hz, SF=10, TxPower=14~dBm:
+
+\begin{verbatim}
+Encabezado LoRa:
+  Dst: 0x06 (Esclavo)
+  LocalAddr: 0x05 (Maestro)
+  MsgSize: 0x07 (7 bytes de payload)
+
+Payload SyncAttempt:
+  Code: 0xC1 (X=1, ZZZZZ=00000, Y=01 → SyncAttempt)
+  BW[1-4]: 0x40 0xE2 0x01 0x00  (125000 Hz, little-endian)
+  SF[5]:   0x0A                  (10)
+  Tx[6]:   0x0E                  (14 dBm)
+\end{verbatim}
+
+\noindent Tras recibir este mensaje, el esclavo configura su radio con BW=125~kHz, SF=10, TxPower=14~dBm y responde con ACK.
+
+\end{document}
