@@ -1,13 +1,7 @@
 /* ---------------------------------------------------------------------
- *  Implementación del Protocolo LoRa - MAESTRO
- *  Práctica 3 - Asignatura (GII-IoT)
- *  
- *  Protocolo definido en protocolo_lora.tex
- *  - Estados: SYNC, CALIBRATING, DATA
- *  - Mensajes: ACK, FORBIDDEN, MSG_SEND, SYNC_CHECK, SYNC_ATTEMPT, CALIBRATION, FINAL_CONFIG
- *  - Calibración automática de TxPower (3-20 dBm)
- *  
- *  Requiere librería Arduino LoRa modificada y Arduino_BQ24195
+ *  PROTOCOLO LORA - MAESTRO
+ *  Calibración completa: BW, SF, CR, TxPower
+ *  Mantiene sincronización usando Safe Config como fallback
  * ---------------------------------------------------------------------
  */
 
@@ -16,147 +10,147 @@
 #include <Arduino_PMIC.h>
 
 // =====================================================================
-// CONFIGURACIÓN DEL PROTOCOLO
+// DIRECCIONES
 // =====================================================================
-
-// Direcciones de red
-const uint8_t localAddress = 0x05;     // Dirección del Maestro
-uint8_t destination = 0x06;            // Dirección del Esclavo
-
-// Timeouts y reintentos (según protocolo)
-#define SYNC_TIMEOUT_MS      120000    // 2 minutos sin mensajes -> resync
-#define ACK_TIMEOUT_MS       3000      // Timeout para esperar ACK
-#define MAX_RETRIES          3         // Número máximo de reintentos
-#define TX_INTERVAL_MS       10000     // Intervalo entre transmisiones
-#define CALIBRATION_INTERVAL_MS 2000   // Intervalo entre pruebas de calibración
-
-// Tamaño máximo de payload
-#define MAX_PAYLOAD_SIZE     50
-
-// Rango de calibración de TxPower
-#define TXPOWER_MIN          3
-#define TXPOWER_MAX          20
+const uint8_t localAddress = 0x05;
+const uint8_t destination = 0x06;
 
 // =====================================================================
-// TIPOS DE MENSAJE (según protocolo)
+// TIMEOUTS
 // =====================================================================
-#define MSG_TYPE_ACK         0x00      // 00 - Confirmación (incluye RSSI/SNR)
-#define MSG_TYPE_FORBIDDEN   0x01      // 01 - Mensaje rechazado
-#define MSG_TYPE_MSG_SEND    0x02      // 10 - Envío de datos
-#define MSG_TYPE_SYNC_CHECK  0x03      // 11 - Verificación de sync
-#define MSG_TYPE_SYNC_ATTEMPT 0x04     // Sincronización inicial
-#define MSG_TYPE_CALIBRATION 0x05      // Mensaje de calibración TxPower
-#define MSG_TYPE_FINAL_CONFIG 0x06     // Configuración final tras calibración
-
-// Bit de rol (Master = 1, Slave = 0)
-#define ROLE_MASTER          0x80
-#define ROLE_SLAVE           0x00
+#define ACK_TIMEOUT_MS       3000
+#define SYNC_TIMEOUT_MS      120000
+#define TX_INTERVAL_MS       5000
+#define CALIB_INTERVAL_MS    1500
 
 // =====================================================================
-// ESTADOS DEL PROTOCOLO
+// TIPOS DE MENSAJE
+// =====================================================================
+#define MSG_TYPE_ACK            0x00
+#define MSG_TYPE_FORBIDDEN      0x01
+#define MSG_TYPE_MSG_SEND       0x02
+#define MSG_TYPE_SYNC_ATTEMPT   0x04
+#define MSG_TYPE_TEST_CONFIG    0x05  // Solicitar prueba de config
+#define MSG_TYPE_PROBE          0x06  // Probe de conectividad
+#define MSG_TYPE_FINAL_CONFIG   0x07  // Config final
+#define MSG_TYPE_POWER_TEST     0x08  // Test de potencia
+
+#define ROLE_MASTER 0x80
+#define MAX_PAYLOAD_SIZE 50
+
+// =====================================================================
+// ESTADOS
 // =====================================================================
 typedef enum {
-  STATE_SYNC,           // Estado inicial - esperar conexión
-  STATE_CALIBRATING,    // Calibrando TxPower
-  STATE_DATA            // Estado operacional
+  STATE_SYNC,
+  STATE_CALIB_MODULATION,
+  STATE_CALIB_POWER,
+  STATE_DATA
 } ProtocolState_t;
 
 // =====================================================================
-// ESTRUCTURA DE CONFIGURACIÓN LORA
+// CONFIGURACIÓN
 // =====================================================================
 typedef struct {
-  uint32_t bandwidth;        // Ancho de banda en Hz
-  uint8_t spreadingFactor;   // Factor de dispersión [6-12]
-  uint8_t codingRate;        // Coding rate [5-8]
-  uint8_t txPower;           // Potencia de TX [2-20] dBm
+  uint32_t bandwidth;
+  uint8_t spreadingFactor;
+  uint8_t codingRate;
+  uint8_t txPower;
 } LoRaConfig_t;
 
-// Estructura para almacenar resultados de calibración
+// Resultado de prueba
 typedef struct {
-  uint8_t txPower;
+  LoRaConfig_t config;
   int rssi;
   float snr;
+  uint32_t airTime;  // Estimación tiempo en aire
   bool valid;
-} CalibrationResult_t;
+} TestResult_t;
 
-// Bandwidths válidos según protocolo
-const uint32_t validBandwidths[] = {125000, 250000, 500000};
-const int numValidBandwidths = 3;
+// Safe Config: robusta para sincronización
+LoRaConfig_t safeConfig = {125000, 10, 5, 20};
+LoRaConfig_t currentConfig;
+LoRaConfig_t testConfig;
+LoRaConfig_t bestModConfig;
+LoRaConfig_t optimalConfig;
 
-// =====================================================================
-// VARIABLES GLOBALES
-// =====================================================================
+// Arrays de valores a probar
+const uint32_t testBandwidths[] = {500000, 250000, 125000};
+const uint8_t testSFs[] = {7, 8, 9, 10, 11, 12};
+const uint8_t testCRs[] = {5, 6, 7, 8};
+const uint8_t numBWs = 3;
+const uint8_t numSFs = 6;
+const uint8_t numCRs = 4;
 
-// Estado del protocolo
+#define TXPOWER_MIN 3
+#define TXPOWER_MAX 20
+#define RSSI_THRESHOLD -110
+#define SNR_THRESHOLD -5.0
+
+// Índices de calibración
+uint8_t idxBW = 0, idxSF = 0, idxCR = 0;
+uint8_t testTxPower = TXPOWER_MAX;
+
+// Mejor resultado de modulación
+TestResult_t bestResult;
+bool foundValidModulation = false;
+
+// Sub-estados de calibración
+typedef enum {
+  CALIB_SEND_TEST_REQ,
+  CALIB_WAIT_TEST_ACK,
+  CALIB_SWITCH_AND_PROBE,
+  CALIB_WAIT_PROBE_ACK,
+  CALIB_REVERT_SAFE
+} CalibSubState_t;
+CalibSubState_t calibSubState = CALIB_SEND_TEST_REQ;
+
+// Estado global
 ProtocolState_t currentState = STATE_SYNC;
 
-// Configuración actual y pendiente
-LoRaConfig_t currentConfig = {125000, 10, 5, 3};   // Config inicial con TxPower mínimo
-LoRaConfig_t pendingConfig = {125000, 10, 5, 3};
-LoRaConfig_t optimalConfig = {125000, 10, 5, 3};   // Config óptima encontrada
-
-// Resultados de calibración
-CalibrationResult_t calibrationResults[TXPOWER_MAX - TXPOWER_MIN + 1];
-uint8_t currentCalibrationTxPower = TXPOWER_MIN;
-uint8_t calibrationAttempts = 0;
-bool calibrationComplete = false;
-
-// Flags de transmisión
-volatile bool txDoneFlag = true;
-volatile bool transmitting = false;
-
-// Contadores y timers
-uint16_t msgCount = 0;
-uint32_t lastMessageTime_ms = 0;
-uint32_t lastSendTime_ms = 0;
-uint32_t txBegin_ms = 0;
-uint32_t txInterval_ms = TX_INTERVAL_MS;
-
-// Control de sincronización
-uint8_t syncRetries = 0;
-bool waitingForAck = false;
-uint32_t ackWaitStart_ms = 0;
-uint8_t pendingMsgType = 0;
-
-// Buffer de recepción
+// Flags y timers
 volatile bool messageReceived = false;
-uint8_t rxBuffer[MAX_PAYLOAD_SIZE + 10];
+bool waitingForAck = false;
+uint32_t ackWaitStart = 0;
+uint32_t lastSendTime = 0;
+uint32_t probeStartTime = 0;
+uint8_t lastCmdType = 0;
+
+// Buffer RX
+uint8_t rxBuffer[MAX_PAYLOAD_SIZE];
 uint8_t rxLength = 0;
 uint8_t rxSender = 0;
 uint8_t rxRecipient = 0;
 int rxRSSI = 0;
 float rxSNR = 0;
-
-// RSSI y SNR reportados por el esclavo
 int remoteRSSI = 0;
 float remoteSNR = 0;
 
 // =====================================================================
-// PROTOTIPOS DE FUNCIONES
+// PROTOTIPOS
 // =====================================================================
 void setupLoRa();
-void applyLoRaConfig(LoRaConfig_t* config);
-void sendMessage(uint8_t* payload, uint8_t payloadLength);
-void sendAck();
-void sendForbidden();
-void sendSyncAttempt();
-void sendCalibrationProbe(uint8_t txPower);
-void sendFinalConfig();
-void sendMsgSend(const char* data, uint8_t len);
+void applyConfig(LoRaConfig_t cfg);
+void sendPacket(uint8_t* data, uint8_t len);
 void onReceive(int packetSize);
-void TxFinished();
-void processReceivedMessage();
-void handleSyncState();
-void handleCalibrationState();
-void handleDataState();
-void checkSyncTimeout();
-void initCalibration();
-void processCalibrationAck();
-void findOptimalTxPower();
-bool validateSyncParams(uint32_t bw, uint8_t sf, uint8_t txPwr);
-void printBinaryPayload(uint8_t* payload, uint8_t payloadLength);
-void printConfig(LoRaConfig_t* config);
-void printCalibrationResults();
+
+void handleSync();
+void handleCalibModulation();
+void handleCalibPower();
+void handleData();
+
+void sendSyncAttempt();
+void sendTestConfigReq(LoRaConfig_t cfg);
+void sendProbe();
+void sendPowerTest(uint8_t pwr);
+void sendFinalConfig(LoRaConfig_t cfg);
+void sendMsgSend(const char* msg);
+void sendAck();
+
+void processMessage();
+void nextModulationTest();
+void evaluateBestModulation();
+float calcAirTimeScore(LoRaConfig_t cfg);
 
 // =====================================================================
 // SETUP
@@ -164,85 +158,47 @@ void printCalibrationResults();
 void setup() {
   Serial.begin(115200);
   while (!Serial);
-
-  Serial.println("========================================");
-  Serial.println("   PROTOCOLO LORA - NODO MAESTRO");
-  Serial.println("   Con calibracion de TxPower");
-  Serial.println("========================================");
-  Serial.print("Direccion local: 0x");
-  Serial.println(localAddress, HEX);
-  Serial.print("Direccion destino: 0x");
-  Serial.println(destination, HEX);
-  Serial.print("Rango TxPower: ");
-  Serial.print(TXPOWER_MIN);
-  Serial.print(" - ");
-  Serial.print(TXPOWER_MAX);
-  Serial.println(" dBm");
-
-  // Inicializar PMIC
+  
+  Serial.println(F("=== MAESTRO LoRa - Calibracion Completa ==="));
+  
   if (!init_PMIC()) {
-    Serial.println("ERROR: Inicializacion de BQ24195L fallida!");
-  } else {
-    Serial.println("OK: BQ24195L inicializado");
+    Serial.println(F("PMIC Error"));
   }
-
-  // Inicializar LoRa
+  
   setupLoRa();
   
-  // Iniciar en estado SYNC
-  currentState = STATE_SYNC;
-  syncRetries = 0;
-  lastMessageTime_ms = millis();
+  currentConfig = safeConfig;
+  bestResult.valid = false;
+  foundValidModulation = false;
   
-  Serial.println("\n>> Estado inicial: SYNC");
-  Serial.println(">> Esperando iniciar calibracion...\n");
+  currentState = STATE_SYNC;
+  lastSendTime = millis();
+  
+  Serial.println(F("Estado: SYNC"));
 }
 
 // =====================================================================
-// LOOP PRINCIPAL
+// LOOP
 // =====================================================================
 void loop() {
-  // Procesar mensaje recibido si hay uno pendiente
   if (messageReceived) {
-    processReceivedMessage();
+    processMessage();
     messageReceived = false;
   }
-
-  // Verificar timeout de sincronización
-  checkSyncTimeout();
-
-  // Máquina de estados
+  
   switch (currentState) {
     case STATE_SYNC:
-      handleSyncState();
+      handleSync();
       break;
-    case STATE_CALIBRATING:
-      handleCalibrationState();
+    case STATE_CALIB_MODULATION:
+      handleCalibModulation();
+      break;
+    case STATE_CALIB_POWER:
+      handleCalibPower();
       break;
     case STATE_DATA:
-      handleDataState();
+      handleData();
       break;
-  }
-
-  // Manejar finalización de transmisión
-  if (transmitting && txDoneFlag) {
-    uint32_t txTime_ms = millis() - txBegin_ms;
-    Serial.print(">> TX completado en ");
-    Serial.print(txTime_ms);
-    Serial.println(" ms");
-
-    // Ajustar intervalo para duty cycle del 1%
-    uint32_t lapse_ms = txBegin_ms - lastSendTime_ms;
-    lastSendTime_ms = txBegin_ms;
-    if (lapse_ms > 0) {
-      float dutyCycle = (100.0f * txTime_ms) / lapse_ms;
-      if (dutyCycle > 1.0f) {
-        txInterval_ms = txTime_ms * 100;
-      }
-    }
-
-    transmitting = false;
-    LoRa.receive();
   }
 }
 
@@ -251,582 +207,467 @@ void loop() {
 // =====================================================================
 void setupLoRa() {
   if (!LoRa.begin(868E6)) {
-    Serial.println("ERROR: LoRa init fallido!");
-    while (true);
+    Serial.println(F("LoRa Error"));
+    while (1);
   }
-
-  applyLoRaConfig(&currentConfig);
-  
+  applyConfig(safeConfig);
   LoRa.setSyncWord(0x12);
   LoRa.setPreambleLength(8);
   LoRa.onReceive(onReceive);
-  LoRa.onTxDone(TxFinished);
   LoRa.receive();
-
-  Serial.println("OK: LoRa inicializado a 868 MHz");
-  printConfig(&currentConfig);
+  Serial.println(F("LoRa OK"));
 }
 
-void applyLoRaConfig(LoRaConfig_t* config) {
-  LoRa.setSignalBandwidth(config->bandwidth);
-  LoRa.setSpreadingFactor(config->spreadingFactor);
-  LoRa.setCodingRate4(config->codingRate);
-  LoRa.setTxPower(config->txPower, PA_OUTPUT_PA_BOOST_PIN);
-}
-
-// =====================================================================
-// INICIALIZAR CALIBRACIÓN
-// =====================================================================
-void initCalibration() {
-  Serial.println("\n========================================");
-  Serial.println("   INICIANDO CALIBRACION DE TxPower");
-  Serial.println("========================================");
-  
-  // Resetear resultados de calibración
-  for (int i = 0; i <= TXPOWER_MAX - TXPOWER_MIN; i++) {
-    calibrationResults[i].txPower = TXPOWER_MIN + i;
-    calibrationResults[i].rssi = -200;  // Valor inválido
-    calibrationResults[i].snr = -50;    // Valor inválido
-    calibrationResults[i].valid = false;
-  }
-  
-  currentCalibrationTxPower = TXPOWER_MIN;
-  calibrationAttempts = 0;
-  calibrationComplete = false;
-  currentState = STATE_CALIBRATING;
-  txInterval_ms = CALIBRATION_INTERVAL_MS;
-  
-  Serial.print("Probando TxPower desde ");
-  Serial.print(TXPOWER_MIN);
-  Serial.print(" hasta ");
-  Serial.print(TXPOWER_MAX);
-  Serial.println(" dBm\n");
+void applyConfig(LoRaConfig_t cfg) {
+  LoRa.setSignalBandwidth(cfg.bandwidth);
+  LoRa.setSpreadingFactor(cfg.spreadingFactor);
+  LoRa.setCodingRate4(cfg.codingRate);
+  LoRa.setTxPower(cfg.txPower, PA_OUTPUT_PA_BOOST_PIN);
+  currentConfig = cfg;
 }
 
 // =====================================================================
-// MANEJO DE ESTADO SYNC
+// ENVÍO DE PAQUETES (BLOQUEANTE)
 // =====================================================================
-void handleSyncState() {
-  // Si estamos esperando ACK del SyncAttempt inicial
-  if (waitingForAck) {
-    if (millis() - ackWaitStart_ms > ACK_TIMEOUT_MS) {
-      Serial.println("!! Timeout esperando ACK de SyncAttempt");
-      syncRetries++;
-      
-      if (syncRetries >= MAX_RETRIES) {
-        Serial.println("!! Maximo de reintentos alcanzado");
-        syncRetries = 0;
-      }
-      waitingForAck = false;
-    }
-    return;
-  }
-
-  // Enviar SyncAttempt inicial para establecer conexión
-  if (!transmitting && (millis() - lastSendTime_ms > txInterval_ms)) {
-    sendSyncAttempt();
-    waitingForAck = true;
-    ackWaitStart_ms = millis();
-    pendingMsgType = MSG_TYPE_SYNC_ATTEMPT;
-  }
-}
-
-// =====================================================================
-// MANEJO DE ESTADO CALIBRACIÓN
-// =====================================================================
-void handleCalibrationState() {
-  // Si estamos esperando ACK de la prueba de calibración
-  if (waitingForAck) {
-    if (millis() - ackWaitStart_ms > ACK_TIMEOUT_MS) {
-      Serial.print("!! Timeout en calibracion TxPower=");
-      Serial.println(currentCalibrationTxPower);
-      
-      calibrationAttempts++;
-      if (calibrationAttempts >= MAX_RETRIES) {
-        // Marcar como inválido y pasar al siguiente
-        int idx = currentCalibrationTxPower - TXPOWER_MIN;
-        calibrationResults[idx].valid = false;
-        
-        currentCalibrationTxPower++;
-        calibrationAttempts = 0;
-        
-        if (currentCalibrationTxPower > TXPOWER_MAX) {
-          // Calibración completa
-          findOptimalTxPower();
-        }
-      }
-      waitingForAck = false;
-    }
-    return;
-  }
-
-  // Enviar siguiente prueba de calibración
-  if (!transmitting && (millis() - lastSendTime_ms > txInterval_ms)) {
-    if (currentCalibrationTxPower <= TXPOWER_MAX) {
-      sendCalibrationProbe(currentCalibrationTxPower);
-      waitingForAck = true;
-      ackWaitStart_ms = millis();
-      pendingMsgType = MSG_TYPE_CALIBRATION;
-    }
-  }
-}
-
-// =====================================================================
-// MANEJO DE ESTADO DATA
-// =====================================================================
-void handleDataState() {
-  if (!transmitting && !waitingForAck && (millis() - lastSendTime_ms > txInterval_ms)) {
-    char testMsg[32];
-    snprintf(testMsg, sizeof(testMsg), "MSG#%d TxPwr=%d", msgCount, optimalConfig.txPower);
-    sendMsgSend(testMsg, strlen(testMsg));
-  }
-
-  if (waitingForAck && (millis() - ackWaitStart_ms > ACK_TIMEOUT_MS)) {
-    Serial.println("!! Timeout esperando ACK de MSG_SEND");
-    waitingForAck = false;
-    syncRetries++;
-    
-    if (syncRetries >= MAX_RETRIES) {
-      Serial.println(">> Volviendo a estado SYNC por falta de ACK\n");
-      currentState = STATE_SYNC;
-      syncRetries = 0;
-      txInterval_ms = TX_INTERVAL_MS;
-    }
-  }
-}
-
-// =====================================================================
-// VERIFICAR TIMEOUT DE SINCRONIZACIÓN
-// =====================================================================
-void checkSyncTimeout() {
-  if (currentState == STATE_DATA) {
-    if (millis() - lastMessageTime_ms > SYNC_TIMEOUT_MS) {
-      Serial.println("\n!! Timeout de sincronizacion (2 min sin mensajes)");
-      Serial.println(">> Reiniciando calibracion...\n");
-      currentState = STATE_SYNC;
-      syncRetries = 0;
-      waitingForAck = false;
-      txInterval_ms = TX_INTERVAL_MS;
-    }
-  }
-}
-
-// =====================================================================
-// ENVÍO DE MENSAJES
-// =====================================================================
-void sendMessage(uint8_t* payload, uint8_t payloadLength) {
-  while (!LoRa.beginPacket()) {
-    delay(10);
-  }
-  
+void sendPacket(uint8_t* data, uint8_t len) {
+  LoRa.beginPacket();
   LoRa.write(destination);
   LoRa.write(localAddress);
-  LoRa.write(payloadLength);
-  LoRa.write(payload, payloadLength);
-  
-  transmitting = true;
-  txDoneFlag = false;
-  txBegin_ms = millis();
-  
-  LoRa.endPacket(true);
+  LoRa.write(len);
+  LoRa.write(data, len);
+  LoRa.endPacket();  // Bloqueante
+  LoRa.receive();
+  lastSendTime = millis();
 }
 
+// =====================================================================
+// RECEPCIÓN
+// =====================================================================
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;
+  
+  rxRecipient = LoRa.read();
+  rxSender = LoRa.read();
+  uint8_t len = LoRa.read();
+  
+  rxLength = 0;
+  while (LoRa.available() && rxLength < MAX_PAYLOAD_SIZE) {
+    rxBuffer[rxLength++] = LoRa.read();
+  }
+  
+  rxRSSI = LoRa.packetRssi();
+  rxSNR = LoRa.packetSnr();
+  
+  if (rxRecipient != localAddress) return;
+  
+  messageReceived = true;
+}
+
+// =====================================================================
+// PROCESAMIENTO DE MENSAJES
+// =====================================================================
+void processMessage() {
+  uint8_t msgType = rxBuffer[0] & 0x0F;
+  
+  Serial.print(F("<< RX Tipo: 0x")); Serial.print(msgType, HEX);
+  Serial.print(F(" RSSI:")); Serial.print(rxRSSI);
+  Serial.print(F(" SNR:")); Serial.println(rxSNR);
+  
+  // Extraer métricas remotas del ACK si las hay
+  if (msgType == MSG_TYPE_ACK && rxLength >= 5) {
+    remoteRSSI = (int16_t)((rxBuffer[2] << 8) | rxBuffer[1]);
+    remoteSNR = ((int16_t)((rxBuffer[4] << 8) | rxBuffer[3])) / 10.0f;
+    Serial.print(F("   Remote RSSI:")); Serial.print(remoteRSSI);
+    Serial.print(F(" SNR:")); Serial.println(remoteSNR);
+  }
+  
+  switch (msgType) {
+    case MSG_TYPE_ACK: {
+      waitingForAck = false;
+      
+      if (lastCmdType == MSG_TYPE_SYNC_ATTEMPT && currentState == STATE_SYNC) {
+        Serial.println(F(">> SYNC OK - Iniciando calibracion modulacion"));
+        currentState = STATE_CALIB_MODULATION;
+        idxBW = 0; idxSF = 0; idxCR = 0;
+        calibSubState = CALIB_SEND_TEST_REQ;
+        bestResult.valid = false;
+        foundValidModulation = false;
+      }
+      else if (currentState == STATE_CALIB_MODULATION) {
+        if (lastCmdType == MSG_TYPE_TEST_CONFIG && calibSubState == CALIB_WAIT_TEST_ACK) {
+          calibSubState = CALIB_SWITCH_AND_PROBE;
+        }
+        else if (lastCmdType == MSG_TYPE_PROBE && calibSubState == CALIB_WAIT_PROBE_ACK) {
+          uint32_t probeTime = millis() - probeStartTime;
+          
+          Serial.print(F("   >> TEST OK: BW=")); Serial.print(testConfig.bandwidth);
+          Serial.print(F(" SF=")); Serial.print(testConfig.spreadingFactor);
+          Serial.print(F(" CR=")); Serial.print(testConfig.codingRate);
+          Serial.print(F(" Time=")); Serial.println(probeTime);
+          
+          if (remoteRSSI > RSSI_THRESHOLD && remoteSNR > SNR_THRESHOLD) {
+            float score = calcAirTimeScore(testConfig);
+            float bestScore = bestResult.valid ? calcAirTimeScore(bestResult.config) : 9999999;
+            
+            if (score < bestScore) {
+              bestResult.config = testConfig;
+              bestResult.rssi = remoteRSSI;
+              bestResult.snr = remoteSNR;
+              bestResult.airTime = probeTime;
+              bestResult.valid = true;
+              foundValidModulation = true;
+              Serial.println(F("   >> Nueva mejor config!"));
+            }
+          }
+          calibSubState = CALIB_REVERT_SAFE;
+        }
+      }
+      else if (currentState == STATE_CALIB_POWER) {
+        if (lastCmdType == MSG_TYPE_POWER_TEST) {
+          if (remoteRSSI > RSSI_THRESHOLD && remoteSNR > SNR_THRESHOLD) {
+            Serial.print(F(">> Power ")); Serial.print(testTxPower);
+            Serial.println(F(" dBm OK"));
+            optimalConfig = bestModConfig;
+            optimalConfig.txPower = testTxPower;
+            sendFinalConfig(optimalConfig);
+            waitingForAck = true;
+            ackWaitStart = millis();
+          } else {
+            testTxPower++;
+            if (testTxPower > TXPOWER_MAX) {
+              optimalConfig = bestModConfig;
+              optimalConfig.txPower = TXPOWER_MAX;
+              sendFinalConfig(optimalConfig);
+              waitingForAck = true;
+              ackWaitStart = millis();
+            }
+          }
+        } else if (lastCmdType == MSG_TYPE_FINAL_CONFIG) {
+          Serial.println(F(">> FINAL_CONFIG ACK - Entrando a DATA"));
+          currentState = STATE_DATA;
+          waitingForAck = false;
+          ackWaitStart = 0;
+        }
+      }
+      else if (currentState == STATE_DATA) {
+        Serial.println(F(">> ACK recibido en DATA"));
+      }
+      lastCmdType = 0;
+      break;
+    }
+      
+    case MSG_TYPE_FORBIDDEN:
+      Serial.println(F(">> FORBIDDEN recibido"));
+      waitingForAck = false;
+      if (currentState == STATE_CALIB_MODULATION) {
+        calibSubState = CALIB_REVERT_SAFE;
+      }
+      break;
+      
+    case MSG_TYPE_MSG_SEND:
+      Serial.println(F(">> MSG recibido"));
+      sendAck();
+      break;
+  }
+}
+
+// =====================================================================
+// ESTADO: SYNC
+// =====================================================================
+void handleSync() {
+  if (waitingForAck) {
+    if (millis() - ackWaitStart > ACK_TIMEOUT_MS) {
+      Serial.println(F("Sync timeout, reintentando..."));
+      waitingForAck = false;
+      lastCmdType = 0;
+    }
+    return;
+  }
+  
+  if (millis() - lastSendTime > 2000) {
+    sendSyncAttempt();
+    waitingForAck = true;
+    ackWaitStart = millis();
+  }
+}
+
+// =====================================================================
+// ESTADO: CALIBRACIÓN MODULACIÓN
+// =====================================================================
+void handleCalibModulation() {
+  // Construir config de prueba actual
+  testConfig.bandwidth = testBandwidths[idxBW];
+  testConfig.spreadingFactor = testSFs[idxSF];
+  testConfig.codingRate = testCRs[idxCR];
+  testConfig.txPower = TXPOWER_MAX;
+  
+  switch (calibSubState) {
+    case CALIB_SEND_TEST_REQ:
+      // Asegurar que estamos en safe config
+      applyConfig(safeConfig);
+      delay(20);
+      
+      Serial.print(F(">> Test BW=")); Serial.print(testConfig.bandwidth);
+      Serial.print(F(" SF=")); Serial.print(testConfig.spreadingFactor);
+      Serial.print(F(" CR=")); Serial.println(testConfig.codingRate);
+      
+      sendTestConfigReq(testConfig);
+      waitingForAck = true;
+      ackWaitStart = millis();
+      calibSubState = CALIB_WAIT_TEST_ACK;
+      break;
+      
+    case CALIB_WAIT_TEST_ACK:
+      if (millis() - ackWaitStart > ACK_TIMEOUT_MS) {
+        Serial.println(F("   Test ACK timeout"));
+        waitingForAck = false;
+        lastCmdType = 0;
+        calibSubState = CALIB_REVERT_SAFE;
+      }
+      break;
+      
+    case CALIB_SWITCH_AND_PROBE:
+      // Cambiar a config de prueba
+      delay(150);  // Dar tiempo al esclavo
+      applyConfig(testConfig);
+      delay(50);
+      
+      probeStartTime = millis();
+      sendProbe();
+      waitingForAck = true;
+      ackWaitStart = millis();
+      calibSubState = CALIB_WAIT_PROBE_ACK;
+      break;
+      
+    case CALIB_WAIT_PROBE_ACK:
+      if (millis() - ackWaitStart > ACK_TIMEOUT_MS) {
+        Serial.println(F("   Probe timeout - config no valida"));
+        waitingForAck = false;
+        lastCmdType = 0;
+        calibSubState = CALIB_REVERT_SAFE;
+      }
+      break;
+      
+    case CALIB_REVERT_SAFE:
+      applyConfig(safeConfig);
+      delay(100);
+      nextModulationTest();
+      break;
+  }
+}
+
+void nextModulationTest() {
+  idxCR++;
+  if (idxCR >= numCRs) {
+    idxCR = 0;
+    idxSF++;
+    if (idxSF >= numSFs) {
+      idxSF = 0;
+      idxBW++;
+      if (idxBW >= numBWs) {
+        // Terminamos todas las pruebas
+        evaluateBestModulation();
+        return;
+      }
+    }
+  }
+  calibSubState = CALIB_SEND_TEST_REQ;
+}
+
+void evaluateBestModulation() {
+  Serial.println(F("\n========== RESULTADOS MODULACION =========="));
+  
+  if (foundValidModulation && bestResult.valid) {
+    Serial.println(F("Mejor configuracion encontrada:"));
+    Serial.print(F("  BW: ")); Serial.println(bestResult.config.bandwidth);
+    Serial.print(F("  SF: ")); Serial.println(bestResult.config.spreadingFactor);
+    Serial.print(F("  CR: ")); Serial.println(bestResult.config.codingRate);
+    Serial.print(F("  RSSI: ")); Serial.println(bestResult.rssi);
+    Serial.print(F("  SNR: ")); Serial.println(bestResult.snr);
+    
+    bestModConfig = bestResult.config;
+    
+    // Iniciar calibración de potencia
+    Serial.println(F("\n>> Iniciando calibracion de potencia"));
+    currentState = STATE_CALIB_POWER;
+    testTxPower = TXPOWER_MIN;
+    
+    // Primero establecer la modulación óptima en el esclavo
+    bestModConfig.txPower = TXPOWER_MAX;
+    sendFinalConfig(bestModConfig);
+    waitingForAck = true;
+    ackWaitStart = millis();
+    
+  } else {
+    Serial.println(F("No se encontro config valida, usando safe"));
+    optimalConfig = safeConfig;
+    sendFinalConfig(optimalConfig);
+    waitingForAck = true;
+    ackWaitStart = millis();
+    currentState = STATE_DATA;
+  }
+}
+
+// =====================================================================
+// ESTADO: CALIBRACIÓN POTENCIA
+// =====================================================================
+void handleCalibPower() {
+  if (waitingForAck) {
+    if (millis() - ackWaitStart > ACK_TIMEOUT_MS) {
+      if (lastCmdType == MSG_TYPE_POWER_TEST) {
+        Serial.println(F("Power test timeout"));
+        waitingForAck = false;
+        lastCmdType = 0;
+        testTxPower++;
+        if (testTxPower > TXPOWER_MAX) {
+          optimalConfig = bestModConfig;
+          optimalConfig.txPower = TXPOWER_MAX;
+          sendFinalConfig(optimalConfig);
+          waitingForAck = true;
+          ackWaitStart = millis();
+        }
+      } else if (lastCmdType == MSG_TYPE_FINAL_CONFIG) {
+        Serial.println(F("Final config timeout, reenviando"));
+        sendFinalConfig(optimalConfig);
+        waitingForAck = true;
+        ackWaitStart = millis();
+      } else {
+        waitingForAck = false;
+        lastCmdType = 0;
+      }
+    }
+    return;
+  }
+  
+  // Ya tenemos la modulación óptima establecida
+  // Probar con potencias crecientes desde el mínimo
+  if (millis() - lastSendTime > CALIB_INTERVAL_MS) {
+    if (testTxPower <= TXPOWER_MAX) {
+      LoRaConfig_t pwrTest = bestModConfig;
+      pwrTest.txPower = testTxPower;
+      applyConfig(pwrTest);
+      
+      Serial.print(F(">> Test Power: ")); Serial.println(testTxPower);
+      sendPowerTest(testTxPower);
+      waitingForAck = true;
+      ackWaitStart = millis();
+    }
+  }
+}
+
+// =====================================================================
+// ESTADO: DATA
+// =====================================================================
+void handleData() {
+  static bool configApplied = false;
+  
+  if (!configApplied) {
+    applyConfig(optimalConfig);
+    configApplied = true;
+    Serial.println(F("\n========== ESTADO DATA =========="));
+    Serial.print(F("Config final: BW=")); Serial.print(optimalConfig.bandwidth);
+    Serial.print(F(" SF=")); Serial.print(optimalConfig.spreadingFactor);
+    Serial.print(F(" CR=")); Serial.print(optimalConfig.codingRate);
+    Serial.print(F(" Pwr=")); Serial.println(optimalConfig.txPower);
+  }
+  
+  if (waitingForAck) {
+    if (millis() - ackWaitStart > ACK_TIMEOUT_MS) {
+      Serial.println(F("Data timeout"));
+      waitingForAck = false;
+      lastCmdType = 0;
+    }
+    return;
+  }
+  
+  if (millis() - lastSendTime > TX_INTERVAL_MS) {
+    sendMsgSend("Hola desde Maestro!");
+    waitingForAck = true;
+    ackWaitStart = millis();
+  }
+}
+
+// =====================================================================
+// FUNCIONES DE ENVÍO
+// =====================================================================
 void sendSyncAttempt() {
-  Serial.println("\n>> Enviando SYNC_ATTEMPT inicial");
-  
-  uint8_t payload[7];
-  uint8_t idx = 0;
-  
-  payload[idx++] = ROLE_MASTER | MSG_TYPE_SYNC_ATTEMPT;
-  
-  // BW (4 bytes, little-endian)
-  payload[idx++] = (uint8_t)(currentConfig.bandwidth & 0xFF);
-  payload[idx++] = (uint8_t)((currentConfig.bandwidth >> 8) & 0xFF);
-  payload[idx++] = (uint8_t)((currentConfig.bandwidth >> 16) & 0xFF);
-  payload[idx++] = (uint8_t)((currentConfig.bandwidth >> 24) & 0xFF);
-  
-  // SF (1 byte)
-  payload[idx++] = currentConfig.spreadingFactor;
-  
-  // TxPower inicial (1 byte)
-  payload[idx++] = currentConfig.txPower;
-  
-  Serial.print("   BW=");
-  Serial.print(currentConfig.bandwidth);
-  Serial.print(" Hz, SF=");
-  Serial.print(currentConfig.spreadingFactor);
-  Serial.print(", TxPower=");
-  Serial.print(currentConfig.txPower);
-  Serial.println(" dBm");
-  
-  sendMessage(payload, idx);
-  msgCount++;
+  Serial.println(F(">> TX SYNC_ATTEMPT"));
+  uint8_t p[8];
+  p[0] = ROLE_MASTER | MSG_TYPE_SYNC_ATTEMPT;
+  memcpy(&p[1], &safeConfig.bandwidth, 4);
+  p[5] = safeConfig.spreadingFactor;
+  p[6] = safeConfig.codingRate;
+  p[7] = safeConfig.txPower;
+  lastCmdType = MSG_TYPE_SYNC_ATTEMPT;
+  sendPacket(p, 8);
 }
 
-void sendCalibrationProbe(uint8_t txPower) {
-  Serial.print("\n>> Probando TxPower = ");
-  Serial.print(txPower);
-  Serial.println(" dBm");
-  
-  // Aplicar el TxPower de prueba
-  LoRa.setTxPower(txPower, PA_OUTPUT_PA_BOOST_PIN);
-  
-  uint8_t payload[2];
-  payload[0] = ROLE_MASTER | MSG_TYPE_CALIBRATION;
-  payload[1] = txPower;
-  
-  sendMessage(payload, 2);
-  msgCount++;
+void sendTestConfigReq(LoRaConfig_t cfg) {
+  uint8_t p[8];
+  p[0] = ROLE_MASTER | MSG_TYPE_TEST_CONFIG;
+  memcpy(&p[1], &cfg.bandwidth, 4);
+  p[5] = cfg.spreadingFactor;
+  p[6] = cfg.codingRate;
+  p[7] = cfg.txPower;
+  lastCmdType = MSG_TYPE_TEST_CONFIG;
+  sendPacket(p, 8);
 }
 
-void sendFinalConfig() {
-  Serial.println("\n>> Enviando CONFIGURACION FINAL");
-  
-  uint8_t payload[7];
-  uint8_t idx = 0;
-  
-  payload[idx++] = ROLE_MASTER | MSG_TYPE_FINAL_CONFIG;
-  
-  // BW (4 bytes, little-endian)
-  payload[idx++] = (uint8_t)(optimalConfig.bandwidth & 0xFF);
-  payload[idx++] = (uint8_t)((optimalConfig.bandwidth >> 8) & 0xFF);
-  payload[idx++] = (uint8_t)((optimalConfig.bandwidth >> 16) & 0xFF);
-  payload[idx++] = (uint8_t)((optimalConfig.bandwidth >> 24) & 0xFF);
-  
-  // SF (1 byte)
-  payload[idx++] = optimalConfig.spreadingFactor;
-  
-  // TxPower óptimo (1 byte)
-  payload[idx++] = optimalConfig.txPower;
-  
-  Serial.println("   Configuracion optima:");
-  printConfig(&optimalConfig);
-  
-  // Aplicar configuración óptima
-  applyLoRaConfig(&optimalConfig);
-  currentConfig = optimalConfig;
-  
-  sendMessage(payload, idx);
-  msgCount++;
-  
-  waitingForAck = true;
-  ackWaitStart_ms = millis();
-  pendingMsgType = MSG_TYPE_FINAL_CONFIG;
+void sendProbe() {
+  uint8_t p[1] = { ROLE_MASTER | MSG_TYPE_PROBE };
+  lastCmdType = MSG_TYPE_PROBE;
+  sendPacket(p, 1);
+}
+
+void sendPowerTest(uint8_t pwr) {
+  uint8_t p[2];
+  p[0] = ROLE_MASTER | MSG_TYPE_POWER_TEST;
+  p[1] = pwr;
+  lastCmdType = MSG_TYPE_POWER_TEST;
+  sendPacket(p, 2);
+}
+
+void sendFinalConfig(LoRaConfig_t cfg) {
+  Serial.println(F(">> TX FINAL_CONFIG"));
+  uint8_t p[8];
+  p[0] = ROLE_MASTER | MSG_TYPE_FINAL_CONFIG;
+  memcpy(&p[1], &cfg.bandwidth, 4);
+  p[5] = cfg.spreadingFactor;
+  p[6] = cfg.codingRate;
+  p[7] = cfg.txPower;
+  lastCmdType = MSG_TYPE_FINAL_CONFIG;
+  sendPacket(p, 8);
+}
+
+void sendMsgSend(const char* msg) {
+  uint8_t p[MAX_PAYLOAD_SIZE];
+  p[0] = ROLE_MASTER | MSG_TYPE_MSG_SEND;
+  uint8_t len = strlen(msg);
+  if (len > MAX_PAYLOAD_SIZE - 2) len = MAX_PAYLOAD_SIZE - 2;
+  memcpy(&p[1], msg, len);
+  lastCmdType = MSG_TYPE_MSG_SEND;
+  sendPacket(p, len + 1);
 }
 
 void sendAck() {
-  Serial.println(">> Enviando ACK");
-  
-  uint8_t payload[1];
-  payload[0] = ROLE_MASTER | MSG_TYPE_ACK;
-  
-  sendMessage(payload, 1);
-  msgCount++;
-}
-
-void sendMsgSend(const char* data, uint8_t len) {
-  Serial.print(">> Enviando MSG_SEND: ");
-  Serial.println(data);
-  
-  uint8_t payload[MAX_PAYLOAD_SIZE];
-  payload[0] = ROLE_MASTER | MSG_TYPE_MSG_SEND;
-  
-  uint8_t copyLen = min(len, (uint8_t)(MAX_PAYLOAD_SIZE - 1));
-  memcpy(&payload[1], data, copyLen);
-  
-  sendMessage(payload, copyLen + 1);
-  msgCount++;
-  
-  waitingForAck = true;
-  ackWaitStart_ms = millis();
-  pendingMsgType = MSG_TYPE_MSG_SEND;
+  uint8_t p[5];
+  p[0] = ROLE_MASTER | MSG_TYPE_ACK;
+  int16_t r = (int16_t)rxRSSI;
+  int16_t s = (int16_t)(rxSNR * 10);
+  p[1] = r & 0xFF; p[2] = (r >> 8) & 0xFF;
+  p[3] = s & 0xFF; p[4] = (s >> 8) & 0xFF;
+  lastCmdType = MSG_TYPE_ACK;
+  sendPacket(p, 5);
 }
 
 // =====================================================================
-// RECEPCIÓN DE MENSAJES (Callback)
+// CÁLCULO SCORE AIRTIME (menor es mejor)
 // =====================================================================
-void onReceive(int packetSize) {
-  if (transmitting && !txDoneFlag) txDoneFlag = true;
-  if (packetSize == 0) return;
-
-  rxRecipient = LoRa.read();
-  rxSender = LoRa.read();
-  uint8_t msgSize = LoRa.read();
-
-  rxLength = 0;
-  while (LoRa.available() && rxLength < sizeof(rxBuffer)) {
-    rxBuffer[rxLength++] = LoRa.read();
-  }
-
-  rxRSSI = LoRa.packetRssi();
-  rxSNR = LoRa.packetSnr();
-
-  if ((rxRecipient & localAddress) != localAddress) {
-    return;
-  }
-
-  if (msgSize != rxLength) {
-    Serial.println("!! Error: longitud de mensaje no coincide");
-    return;
-  }
-
-  messageReceived = true;
-  lastMessageTime_ms = millis();
-}
-
-// =====================================================================
-// PROCESAMIENTO DE MENSAJES RECIBIDOS
-// =====================================================================
-void processReceivedMessage() {
-  if (rxLength == 0) return;
-
-  uint8_t header = rxBuffer[0];
-  uint8_t msgType = header & 0x0F;
-
-  Serial.println("\n----------------------------------------");
-  Serial.print("<< Mensaje recibido de 0x");
-  Serial.println(rxSender, HEX);
-  Serial.print("   Tipo: ");
-
-  switch (msgType) {
-    case MSG_TYPE_ACK:
-      Serial.println("ACK");
-      handleReceivedAck();
-      break;
-
-    case MSG_TYPE_FORBIDDEN:
-      Serial.println("FORBIDDEN");
-      handleReceivedForbidden();
-      break;
-
-    case MSG_TYPE_MSG_SEND:
-      Serial.println("MSG_SEND");
-      handleReceivedMsgSend();
-      break;
-
-    default:
-      Serial.print("DESCONOCIDO (0x");
-      Serial.print(msgType, HEX);
-      Serial.println(")");
-      break;
-  }
-
-  Serial.print("   RSSI local: ");
-  Serial.print(rxRSSI);
-  Serial.print(" dBm, SNR local: ");
-  Serial.print(rxSNR, 1);
-  Serial.println(" dB");
-  Serial.println("----------------------------------------\n");
-}
-
-void handleReceivedAck() {
-  // Extraer RSSI y SNR reportados por el esclavo (si están presentes)
-  if (rxLength >= 5) {
-    // El esclavo envía: Header(1) + RSSI(2, signed) + SNR(2, signed*10)
-    int16_t reportedRSSI = (int16_t)((rxBuffer[2] << 8) | rxBuffer[1]);
-    int16_t reportedSNR_x10 = (int16_t)((rxBuffer[4] << 8) | rxBuffer[3]);
-    remoteRSSI = reportedRSSI;
-    remoteSNR = reportedSNR_x10 / 10.0f;
-    
-    Serial.print("   RSSI remoto: ");
-    Serial.print(remoteRSSI);
-    Serial.print(" dBm, SNR remoto: ");
-    Serial.print(remoteSNR, 1);
-    Serial.println(" dB");
-  }
-
-  if (!waitingForAck) return;
-  
-  waitingForAck = false;
-  syncRetries = 0;
-
-  if (currentState == STATE_SYNC && pendingMsgType == MSG_TYPE_SYNC_ATTEMPT) {
-    Serial.println("   >> ACK de SyncAttempt - Iniciando calibracion");
-    initCalibration();
-  }
-  else if (currentState == STATE_CALIBRATING && pendingMsgType == MSG_TYPE_CALIBRATION) {
-    processCalibrationAck();
-  }
-  else if (pendingMsgType == MSG_TYPE_FINAL_CONFIG) {
-    Serial.println("   >> ACK de configuracion final!");
-    Serial.println("   >> Transicion a estado DATA");
-    currentState = STATE_DATA;
-    txInterval_ms = TX_INTERVAL_MS;
-  }
-  else if (currentState == STATE_DATA && pendingMsgType == MSG_TYPE_MSG_SEND) {
-    Serial.println("   >> ACK de MSG_SEND recibido!");
-  }
-}
-
-void processCalibrationAck() {
-  int idx = currentCalibrationTxPower - TXPOWER_MIN;
-  
-  // Guardar resultados usando el RSSI/SNR remoto (lo que el esclavo ve)
-  calibrationResults[idx].txPower = currentCalibrationTxPower;
-  calibrationResults[idx].rssi = remoteRSSI;
-  calibrationResults[idx].snr = remoteSNR;
-  calibrationResults[idx].valid = true;
-  
-  Serial.print("   >> Calibracion TxPower=");
-  Serial.print(currentCalibrationTxPower);
-  Serial.print(" -> RSSI=");
-  Serial.print(remoteRSSI);
-  Serial.print(" dBm, SNR=");
-  Serial.print(remoteSNR, 1);
-  Serial.println(" dB");
-  
-  // Siguiente TxPower
-  currentCalibrationTxPower++;
-  calibrationAttempts = 0;
-  
-  if (currentCalibrationTxPower > TXPOWER_MAX) {
-    findOptimalTxPower();
-  }
-}
-
-void findOptimalTxPower() {
-  Serial.println("\n========================================");
-  Serial.println("   RESULTADOS DE CALIBRACION");
-  Serial.println("========================================");
-  
-  printCalibrationResults();
-  
-  // Buscar el TxPower óptimo
-  // Criterio: mejor SNR primero, luego mejor RSSI como desempate
-  // También consideramos eficiencia energética (preferir menor TxPower si calidad similar)
-  
-  int bestIdx = -1;
-  float bestScore = -1000;
-  
-  for (int i = 0; i <= TXPOWER_MAX - TXPOWER_MIN; i++) {
-    if (!calibrationResults[i].valid) continue;
-    
-    // Score combinado: SNR tiene más peso que RSSI
-    // Penalizamos ligeramente TxPower alto para eficiencia energética
-    float score = (calibrationResults[i].snr * 2.0f) + 
-                  (calibrationResults[i].rssi + 100) * 0.5f -
-                  (calibrationResults[i].txPower - TXPOWER_MIN) * 0.1f;
-    
-    if (score > bestScore) {
-      bestScore = score;
-      bestIdx = i;
-    }
-  }
-  
-  if (bestIdx >= 0) {
-    optimalConfig.bandwidth = currentConfig.bandwidth;
-    optimalConfig.spreadingFactor = currentConfig.spreadingFactor;
-    optimalConfig.codingRate = currentConfig.codingRate;
-    optimalConfig.txPower = calibrationResults[bestIdx].txPower;
-    
-    Serial.println("\n>> TxPower optimo encontrado:");
-    Serial.print("   TxPower = ");
-    Serial.print(optimalConfig.txPower);
-    Serial.println(" dBm");
-    Serial.print("   RSSI = ");
-    Serial.print(calibrationResults[bestIdx].rssi);
-    Serial.println(" dBm");
-    Serial.print("   SNR = ");
-    Serial.print(calibrationResults[bestIdx].snr, 1);
-    Serial.println(" dB");
-    
-    // Enviar configuración final al esclavo
-    sendFinalConfig();
-  }
-  else {
-    Serial.println("!! No se encontro TxPower valido!");
-    Serial.println(">> Usando TxPower por defecto (10 dBm)");
-    optimalConfig.txPower = 10;
-    sendFinalConfig();
-  }
-}
-
-void handleReceivedForbidden() {
-  Serial.println("   >> Mensaje rechazado por el esclavo");
-  waitingForAck = false;
-  
-  if (currentState == STATE_SYNC) {
-    syncRetries++;
-  }
-}
-
-void handleReceivedMsgSend() {
-  if (rxLength > 1) {
-    char msg[MAX_PAYLOAD_SIZE];
-    uint8_t msgLen = rxLength - 1;
-    memcpy(msg, &rxBuffer[1], msgLen);
-    msg[msgLen] = '\0';
-    
-    Serial.print("   Contenido: ");
-    Serial.println(msg);
-  }
-  
-  sendAck();
-}
-
-// =====================================================================
-// FUNCIONES AUXILIARES
-// =====================================================================
-bool validateSyncParams(uint32_t bw, uint8_t sf, uint8_t txPwr) {
-  bool validBW = false;
-  for (int i = 0; i < numValidBandwidths; i++) {
-    if (bw == validBandwidths[i]) {
-      validBW = true;
-      break;
-    }
-  }
-  if (!validBW) return false;
-  if (sf < 6 || sf > 12) return false;
-  if (txPwr < 2 || txPwr > 20) return false;
-  return true;
-}
-
-void TxFinished() {
-  txDoneFlag = true;
-}
-
-void printBinaryPayload(uint8_t* payload, uint8_t payloadLength) {
-  for (int i = 0; i < payloadLength; i++) {
-    Serial.print((payload[i] & 0xF0) >> 4, HEX);
-    Serial.print(payload[i] & 0x0F, HEX);
-    Serial.print(" ");
-  }
-}
-
-void printConfig(LoRaConfig_t* config) {
-  Serial.println("   Configuracion LoRa:");
-  Serial.print("   - BW: ");
-  Serial.print(config->bandwidth);
-  Serial.println(" Hz");
-  Serial.print("   - SF: ");
-  Serial.println(config->spreadingFactor);
-  Serial.print("   - CR: ");
-  Serial.println(config->codingRate);
-  Serial.print("   - TxPower: ");
-  Serial.print(config->txPower);
-  Serial.println(" dBm");
-}
-
-void printCalibrationResults() {
-  Serial.println("TxPower | RSSI (dBm) | SNR (dB) | Estado");
-  Serial.println("--------|------------|----------|--------");
-  
-  for (int i = 0; i <= TXPOWER_MAX - TXPOWER_MIN; i++) {
-    Serial.print("   ");
-    if (calibrationResults[i].txPower < 10) Serial.print(" ");
-    Serial.print(calibrationResults[i].txPower);
-    Serial.print("   |    ");
-    
-    if (calibrationResults[i].valid) {
-      if (calibrationResults[i].rssi > -100) Serial.print(" ");
-      Serial.print(calibrationResults[i].rssi);
-      Serial.print("    |   ");
-      if (calibrationResults[i].snr >= 0) Serial.print(" ");
-      Serial.print(calibrationResults[i].snr, 1);
-      Serial.println("   |   OK");
-    }
-    else {
-      Serial.println("   --     |    --    |  FAIL");
-    }
-  }
+float calcAirTimeScore(LoRaConfig_t cfg) {
+  // Fórmula aproximada: AirTime proporcional a (2^SF) / BW
+  // Menor score = más rápido = mejor
+  float score = (float)(1UL << cfg.spreadingFactor) / (float)cfg.bandwidth;
+  // Penalizar CR alto (más redundancia = más lento)
+  score *= (float)(cfg.codingRate) / 5.0f;
+  return score * 1000000.0f;  // Escalar para legibilidad
 }
