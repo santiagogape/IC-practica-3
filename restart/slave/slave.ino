@@ -61,7 +61,7 @@ void applyRadioBW_SF(uint8_t sf, long bw) {
   bandwidth       = bw;
   Serial.print(" Config aplicada - BW: "); Serial.print(bw);
   Serial.print(" Hz, SF: "); Serial.println(sf);
-  delay(50);
+  delay(10);
   LoRa.receive();
 }
 
@@ -74,7 +74,7 @@ void applyRadioTX(uint8_t tx) {
   LoRa.setTxPower(tx, PA_OUTPUT_PA_BOOST_PIN);
   txPower = tx;
   Serial.print(" TX aplicado: "); Serial.println(tx);
-  delay(50);
+  delay(10);
   LoRa.receive();
 }
 
@@ -108,7 +108,7 @@ void sendACK(const char* outgoing) {
   LoRa.endPacket();
   messageCount++;
   Serial.print(">> ACK enviado: '"); Serial.print(outgoing); Serial.println("'");
-  delay(30);
+  delay(10);
   LoRa.receive();
 }
 
@@ -175,14 +175,14 @@ void onReceive(int packetSize) {
     applyRadioTX(ORIGINAL_TX);
     sendACK("SA");
     state = WAIT_SYNC;
-    delay(40); LoRa.receive();
+    delay(10); LoRa.receive();
     return;
   }
   if (cmd == "QS") {
     char buf[48];
     snprintf(buf, sizeof(buf), "SSX%ldY%uT%u", bandwidth, spreadingFactor, txPower);
     sendACK(buf);
-    delay(20); LoRa.receive();
+    delay(10); LoRa.receive();
     return;
   }
 

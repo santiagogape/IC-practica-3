@@ -1,10 +1,6 @@
 /* ------------------------------------------------------------
- * MAESTRO LoRa - Sincronización completa + Selección óptima
+ * MAESTRO LoRa - Sincronización + Selección TX/BW/SF simplificada
  * Dirección local: 0x06, destino: 0x05, SyncWord: 0x12
- * - Handshake robusto (TX y BW/SF)
- * - Medición de tiempo de transferencia
- * - Selección automática de mejor configuración
- * - Mensajería M con ACK "MA"
  * ------------------------------------------------------------ */
 
 #include <SPI.h>
@@ -16,8 +12,7 @@ const uint8_t localAddress = 0x06;
 uint8_t destination        = 0x05;
 const uint8_t SYNC_WORD    = 0x12;
 
-#define TX_LAPSE_MS       15000
-#define WAIT_TIMEOUT_MS    2500
+#define WAIT_TIMEOUT_MS     2500
 
 // Config original
 #define ORIGINAL_BW 125000L
@@ -55,7 +50,6 @@ static bool transmitting = false;
 static uint32_t tx_begin_ms = 0;
 
 static uint16_t msgCount = 0;
-static uint32_t txInterval_ms = TX_LAPSE_MS;
 
 // Config actual
 long     currentBW = ORIGINAL_BW;
@@ -86,8 +80,7 @@ struct TxTestResult {
 TxTestResult txResults[21];
 uint8_t      txResultsCount = 0;
 uint8_t      bestTxIndex    = 0;
-volatile bool txFinalizationPending = false;
-uint8_t      bestTXCache = ORIGINAL_TX;
+uint8_t      bestTXCache    = ORIGINAL_TX;
 
 // Estructura para resultados BW/SF con medición de tiempo
 struct BwSfTestResult {
@@ -95,13 +88,12 @@ struct BwSfTestResult {
   uint8_t sf;
   int rssi;
   float snr;
-  uint32_t transferTime_ms;  // NUEVO: tiempo de transferencia
+  uint32_t transferTime_ms;
   float quality;
 };
 BwSfTestResult bwsfResults[10];
 uint8_t bwsfResultsCount = 0;
 uint8_t bestBwSfIndex = 0;
-volatile bool bwsfFinalizationPending = false;
 long    bestBW_cache = ORIGINAL_BW;
 uint8_t bestSF_cache = ORIGINAL_SF;
 
@@ -137,7 +129,7 @@ void maestroMessagingTick();
 void setup() {
   Serial.begin(9600);
   while (!Serial);
-  Serial.println("=== MAESTRO LoRa - Sincronización Optimizada ===");
+  Serial.println("=== MAESTRO LoRa - Sync Simplificada ===");
 
   if (!init_PMIC()) Serial.println("Aviso: BQ24195L no inicializado");
   else              Serial.println("OK: BQ24195L inicializado");
@@ -201,114 +193,81 @@ void loop() {
     waitStartTime = millis();
     lastStateForTimer = syncState;
   }
+
   if ((syncState == WAIT_SA_AFTER_ST ||
        syncState == WAIT_SA_AFTER_TX ||
        syncState == WAIT_SA_AFTER_SE_TX ||
        syncState == WAIT_SA_AFTER_SI ||
        syncState == WAIT_SA_AFTER_CONFIG ||
        syncState == WAIT_SA_AFTER_SE_BWSF) &&
-      (millis() - waitStartTime > WAIT_TIMEOUT_MS)) {
+       (millis() - waitStartTime > WAIT_TIMEOUT_MS)) {
 
     Serial.println("\n!!! TIMEOUT esperando SA !!!");
 
     if (currentPhase == PHASE_TX_SYNC) {
-      if (txFinalizationPending) {
-        Serial.println("Timeout en FINALIZACIÓN TX: reintentando");
-        if (syncState == WAIT_SA_AFTER_ST) {
-          strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
-        } else if (syncState == WAIT_SA_AFTER_TX) {
-          snprintf(pendingMsg, sizeof(pendingMsg), "T%u", bestTXCache);
-          pendingMsgLen = strlen(pendingMsg); pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_TX; syncState = IDLE;
-        } else if (syncState == WAIT_SA_AFTER_SE_TX) {
-          strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_SE_TX; syncState = IDLE;
-        }
-        LoRa.receive();
+      Serial.println("Timeout en TX, avanzar...\n");
+      // No reintentar infinitamente; pasar a siguiente TX
+      txIndex++;
+      if (txIndex < SYNC_TX_COUNT) {
+        strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
+        protocolPendingState = WAIT_SA_AFTER_ST;
+        syncState = WAIT_SA_AFTER_ST;
       } else {
-        Serial.println("Avanzando a siguiente TX...\n");
-        LoRa.idle();
-        LoRa.setTxPower(prev_txpower, PA_OUTPUT_PA_BOOST_PIN);
-        LoRa.receive();
-        currentTX = prev_txpower;
-
-        txIndex++;
-        if (txIndex < SYNC_TX_COUNT) {
-          delay(300);
-          strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
+        if (txResultsCount == 0) {
+          Serial.println("\n!!! Sin resultados TX, reiniciando !!!\n");
+          LoRa.idle();
+          LoRa.setSignalBandwidth(ORIGINAL_BW);
+          LoRa.setSpreadingFactor(ORIGINAL_SF);
+          LoRa.setTxPower(ORIGINAL_TX, PA_OUTPUT_PA_BOOST_PIN);
+          LoRa.receive();
+          currentBW = ORIGINAL_BW; currentSF = ORIGINAL_SF; currentTX = ORIGINAL_TX;
+          txIndex = 0; syncIndex = 0; currentPhase = PHASE_TX_SYNC;
+          syncState = IDLE; protocolPendingState = IDLE;
         } else {
-          if (txResultsCount == 0) {
-            Serial.println("\n!!! Sin resultados TX, reiniciando !!!\n");
-            LoRa.idle();
-            LoRa.setSignalBandwidth(ORIGINAL_BW);
-            LoRa.setSpreadingFactor(ORIGINAL_SF);
-            LoRa.setTxPower(ORIGINAL_TX, PA_OUTPUT_PA_BOOST_PIN);
-            LoRa.receive();
-            currentBW = ORIGINAL_BW; currentSF = ORIGINAL_SF; currentTX = ORIGINAL_TX;
-            txIndex = 0; syncIndex = 0; currentPhase = PHASE_TX_SYNC;
-            syncState = IDLE; protocolPendingState = IDLE;
-            delay(500);
-          } else {
-            calculateBestTxPower();
-          }
+          calculateBestTxPower();
         }
       }
     } else if (currentPhase == PHASE_BWSF_SYNC) {
-      if (bwsfFinalizationPending) {
-        Serial.println("Timeout en FINALIZACIÓN BW/SF: reintentando");
-        if (syncState == WAIT_SA_AFTER_SI) {
-          strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
-        } else if (syncState == WAIT_SA_AFTER_CONFIG) {
-          snprintf(pendingMsg, sizeof(pendingMsg), "X%ldY%u", bestBW_cache, bestSF_cache);
-          pendingMsgLen = strlen(pendingMsg); pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_CONFIG; syncState = IDLE;
-        } else if (syncState == WAIT_SA_AFTER_SE_BWSF) {
-          strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_SE_BWSF; syncState = IDLE;
-        }
-        LoRa.receive();
+      Serial.println("Timeout en BW/SF, avanzar...\n");
+      // Igual: avanzar al siguiente BW/SF sin reintentar infinito
+      syncIndex++;
+      if (syncIndex < SYNC_TESTS_COUNT) {
+        strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+        protocolPendingState = WAIT_SA_AFTER_SI;
+        syncState = WAIT_SA_AFTER_SI;
       } else {
-        Serial.println("Timeout en BW/SF, avanzar...\n");
-        LoRa.idle();
-        LoRa.setSignalBandwidth(prev_bandwidth);
-        LoRa.setSpreadingFactor(prev_spreadingFactor);
-        LoRa.receive();
-        currentBW = prev_bandwidth;
-        currentSF = prev_spreadingFactor;
-
-        syncIndex++;
-        if (syncIndex < SYNC_TESTS_COUNT) {
-          delay(300);
-          strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
+        if (bwsfResultsCount == 0) {
+          Serial.println("\n!!! Sin resultados BW/SF !!!\n");
+          currentPhase = PHASE_COMPLETE; syncState = IDLE;
         } else {
-          if (bwsfResultsCount == 0) {
-            Serial.println("\n!!! Sin resultados BW/SF !!!\n");
-            currentPhase = PHASE_COMPLETE; syncState = IDLE;
-          } else {
-            calculateBestBwSf();
-          }
+          calculateBestBwSf();
         }
       }
     }
   }
 
-  // Arranque automático
-  static bool protocolStarted = false;
-  if (!protocolStarted && syncState == IDLE && !transmitting) {
-    if (currentPhase == PHASE_TX_SYNC) {
-      Serial.println("\n>>> FASE 1: Sincronización TX <<<\n");
-      strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
-      protocolPendingState = WAIT_SA_AFTER_ST; protocolStarted = true;
-    } else if (currentPhase == PHASE_BWSF_SYNC) {
-      Serial.println("\n>>> FASE 2: Sincronización BW/SF <<<\n");
-      strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
-      protocolPendingState = WAIT_SA_AFTER_SI; protocolStarted = true;
-    }
-  }
+  // Arranque automático por fase
+static bool txPhaseStarted   = false;
+static bool bwsfPhaseStarted = false;
+
+if (currentPhase == PHASE_TX_SYNC &&
+    !txPhaseStarted && syncState == IDLE && !transmitting) {
+  Serial.println("\n>>> FASE 1: Sincronización TX <<<\n");
+  strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
+  protocolPendingState = WAIT_SA_AFTER_ST;
+  syncState = WAIT_SA_AFTER_ST;
+  txPhaseStarted = true;
+}
+
+if (currentPhase == PHASE_BWSF_SYNC &&
+    !bwsfPhaseStarted && syncState == IDLE && !transmitting) {
+  Serial.println("\n>>> FASE 2: Sincronización BW/SF <<<\n");
+  strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+  protocolPendingState = WAIT_SA_AFTER_SI;
+  syncState = WAIT_SA_AFTER_SI;
+  bwsfPhaseStarted = true;
+}
+
 
   maestroMessagingTick();
   delay(10);
@@ -325,12 +284,12 @@ void sendMessage(char* outgoing, uint8_t msgLength, uint16_t &msgCountRef) {
   LoRa.write((uint8_t)(msgCountRef & 0xFF));
   LoRa.write(msgLength);
   LoRa.print(outgoing);
-  LoRa.endPacket(true);
+  LoRa.endPacket(true);   // async
   msgCountRef++;
 }
 
 // ======================================================
-// onReceive: procesamiento mejorado con medición de tiempo
+// onReceive
 // ======================================================
 void onReceive(int packetSize) {
   if (packetSize == 0) return;
@@ -357,7 +316,7 @@ void onReceive(int packetSize) {
   Serial.print("'  RSSI: "); Serial.print(rssi);
   Serial.print(" dBm  SNR: "); Serial.println(snr);
 
-  // Captura SS y MA
+  // SS y MA
   if (receivedBytes >= 2 && buffer[0] == 'S' && buffer[1] == 'S') {
     String s = String(buffer);
     int ixX = s.indexOf('X');
@@ -374,74 +333,73 @@ void onReceive(int packetSize) {
     lastMAReceived = true;
   }
 
-  // Sólo procesamos SA
+  // Sólo procesamos SA para la FSM de sync
   if (!(receivedBytes >= 2 && buffer[0] == 'S' && buffer[1] == 'A')) {
     return;
   }
-  Serial.println(" SA recibido");
+  Serial.print(" SA recibido en estado ");
+  Serial.println((int)syncState);
 
   // ===== FASE TX POWER =====
   if (currentPhase == PHASE_TX_SYNC) {
     if (syncState == WAIT_SA_AFTER_ST) {
-      uint8_t txToSend = txFinalizationPending ? bestTXCache : sync_txpower[txIndex];
+      // Enviar Tn
+      uint8_t txToSend = sync_txpower[txIndex];
       snprintf(pendingMsg, sizeof(pendingMsg), "T%u", txToSend);
       pendingMsgLen = strlen(pendingMsg); pendingSend = true;
       protocolPendingState = WAIT_SA_AFTER_TX;
+      syncState = WAIT_SA_AFTER_TX;
     }
     else if (syncState == WAIT_SA_AFTER_TX) {
-      uint8_t newTX = txFinalizationPending ? bestTXCache : sync_txpower[txIndex];
+      // Aplicar TX nuevo
+      uint8_t newTX = sync_txpower[txIndex];
       prev_txpower = currentTX;
       LoRa.idle();
       currentTX = newTX;
       LoRa.setTxPower(newTX, PA_OUTPUT_PA_BOOST_PIN);
       LoRa.receive();
-      delay(80);
+      delay(10);
 
+      // Pedir SE
       strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
       protocolPendingState = WAIT_SA_AFTER_SE_TX;
+      syncState = WAIT_SA_AFTER_SE_TX;
     }
     else if (syncState == WAIT_SA_AFTER_SE_TX) {
-      if (txFinalizationPending) {
-        Serial.println(" Ciclo TX FINAL completado -> pasar a BW/SF\n");
-        txFinalizationPending = false;
-        currentPhase = PHASE_BWSF_SYNC;
-        strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
-        protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
-      } else {
-        txResults[txResultsCount].txpower = currentTX;
-        txResults[txResultsCount].rssi    = rssi;
-        txResults[txResultsCount].snr     = snr;
-        txResults[txResultsCount].quality = snr * 2.0 + (rssi + 100) * 0.5;
-        txResultsCount++;
-        txIndex++;
+      // Guardar resultado de esta TX
+      txResults[txResultsCount].txpower = currentTX;
+      txResults[txResultsCount].rssi    = rssi;
+      txResults[txResultsCount].snr     = snr;
+      txResults[txResultsCount].quality = snr * 2.0 + (rssi + 100) * 0.5;
+      txResultsCount++;
+      txIndex++;
 
-        if (txIndex < SYNC_TX_COUNT) {
-          delay(250);
-          strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
-        } else {
-          calculateBestTxPower();
-        }
+      if (txIndex < SYNC_TX_COUNT) {
+        strcpy(pendingMsg, "ST"); pendingMsgLen = 2; pendingSend = true;
+        protocolPendingState = WAIT_SA_AFTER_ST; syncState = WAIT_SA_AFTER_ST;
+      } else {
+        calculateBestTxPower();
       }
     }
   }
 
-  // ===== FASE BW/SF CON MEDICIÓN DE TIEMPO =====
+  // ===== FASE BW/SF =====
   if (currentPhase == PHASE_BWSF_SYNC) {
     if (syncState == WAIT_SA_AFTER_SI) {
-      long testBW = bwsfFinalizationPending ? bestBW_cache : sync_bw[syncIndex];
-      uint8_t testSF = bwsfFinalizationPending ? bestSF_cache : sync_sf[syncIndex];
-      
+      // Enviar XBWYSF
+      long testBW   = sync_bw[syncIndex];
+      uint8_t testSF = sync_sf[syncIndex];
       snprintf(pendingMsg, sizeof(pendingMsg), "X%ldY%u", testBW, testSF);
       pendingMsgLen = strlen(pendingMsg); pendingSend = true;
       protocolPendingState = WAIT_SA_AFTER_CONFIG;
-      
-      // INICIO de medición de tiempo del ciclo
+      syncState = WAIT_SA_AFTER_CONFIG;
+
       cycleStartTime_ms = millis();
     }
     else if (syncState == WAIT_SA_AFTER_CONFIG) {
-      long newBW = bwsfFinalizationPending ? bestBW_cache : sync_bw[syncIndex];
-      uint8_t newSF = bwsfFinalizationPending ? bestSF_cache : sync_sf[syncIndex];
+      // Aplicar BW/SF nuevo
+      long newBW   = sync_bw[syncIndex];
+      uint8_t newSF = sync_sf[syncIndex];
 
       LoRa.idle();
       LoRa.setSignalBandwidth(newBW);
@@ -452,47 +410,33 @@ void onReceive(int packetSize) {
       prev_bandwidth       = currentBW;
       currentBW = newBW; currentSF = newSF;
 
-      delay(80);
+      delay(10);
       strcpy(pendingMsg, "SE"); pendingMsgLen = 2; pendingSend = true;
       protocolPendingState = WAIT_SA_AFTER_SE_BWSF;
+      syncState = WAIT_SA_AFTER_SE_BWSF;
     }
     else if (syncState == WAIT_SA_AFTER_SE_BWSF) {
-      // FIN de medición: calcular tiempo total del ciclo
+      // Cerrar ciclo y guardar resultado
       uint32_t cycleTime = millis() - cycleStartTime_ms;
-      
-      if (bwsfFinalizationPending) {
-        Serial.println(" Ciclo BW/SF FINAL completado!");
-        Serial.println("\n===========================================");
-        Serial.println(">>> SINCRONIZACIÓN COMPLETA <<<");
-        Serial.print(">>> Config óptima: BW="); Serial.print(currentBW);
-        Serial.print(" Hz, SF="); Serial.print(currentSF);
-        Serial.print(", TX="); Serial.println(currentTX);
-        Serial.println("===========================================\n");
-        
-        bwsfFinalizationPending = false;
-        currentPhase = PHASE_COMPLETE; syncState = IDLE;
-        protocolPendingState = IDLE; pendingSend = false;
+
+      Serial.print(" Ciclo BW/SF completado en "); 
+      Serial.print(cycleTime); 
+      Serial.println(" ms");
+
+      bwsfResults[bwsfResultsCount].bw = currentBW;
+      bwsfResults[bwsfResultsCount].sf = currentSF;
+      bwsfResults[bwsfResultsCount].rssi = rssi;
+      bwsfResults[bwsfResultsCount].snr = snr;
+      bwsfResults[bwsfResultsCount].transferTime_ms = cycleTime;
+      bwsfResults[bwsfResultsCount].quality = snr * 2.0 + (rssi + 100) * 0.5;
+      bwsfResultsCount++;
+
+      syncIndex++;
+      if (syncIndex < SYNC_TESTS_COUNT) {
+        strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
+        protocolPendingState = WAIT_SA_AFTER_SI; syncState = WAIT_SA_AFTER_SI;
       } else {
-        Serial.print(" Ciclo completado en "); 
-        Serial.print(cycleTime); 
-        Serial.println(" ms");
-        
-        bwsfResults[bwsfResultsCount].bw = currentBW;
-        bwsfResults[bwsfResultsCount].sf = currentSF;
-        bwsfResults[bwsfResultsCount].rssi = rssi;
-        bwsfResults[bwsfResultsCount].snr = snr;
-        bwsfResults[bwsfResultsCount].transferTime_ms = cycleTime;
-        bwsfResults[bwsfResultsCount].quality = snr * 2.0 + (rssi + 100) * 0.5;
-        bwsfResultsCount++;
-        
-        syncIndex++;
-        if (syncIndex < SYNC_TESTS_COUNT) {
-          delay(250);
-          strcpy(pendingMsg, "SI"); pendingMsgLen = 2; pendingSend = true;
-          protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
-        } else {
-          calculateBestBwSf();
-        }
+        calculateBestBwSf();
       }
     }
   }
@@ -510,15 +454,8 @@ void calculateBestTxPower() {
 
   if (txResultsCount == 0) {
     Serial.println("Sin resultados TX\n");
-    LoRa.idle();
-    LoRa.setSignalBandwidth(ORIGINAL_BW);
-    LoRa.setSpreadingFactor(ORIGINAL_SF);
-    LoRa.setTxPower(ORIGINAL_TX, PA_OUTPUT_PA_BOOST_PIN);
-    LoRa.receive();
-    currentBW = ORIGINAL_BW; currentSF = ORIGINAL_SF; currentTX = ORIGINAL_TX;
-    txIndex = 0; syncIndex = 0; currentPhase = PHASE_TX_SYNC;
-    syncState = IDLE; protocolPendingState = IDLE;
-    delay(500);
+    currentPhase = PHASE_BWSF_SYNC;
+    syncState = IDLE;
     return;
   }
 
@@ -539,14 +476,19 @@ void calculateBestTxPower() {
   Serial.print(">>> MEJOR TX POWER: "); Serial.println(bestTXCache);
   Serial.println("===========================================\n");
 
-  txFinalizationPending = true;
-  strcpy(pendingMsg, "ST");
-  pendingMsgLen = 2; pendingSend = true;
-  protocolPendingState = WAIT_SA_AFTER_ST; syncState = IDLE;
+  // Aplicar TX óptimo localmente
+  LoRa.idle();
+  LoRa.setTxPower(bestTXCache, PA_OUTPUT_PA_BOOST_PIN);
+  LoRa.receive();
+  currentTX = bestTXCache;
+
+  // Pasar directamente a BW/SF
+  currentPhase = PHASE_BWSF_SYNC;
+  syncState = IDLE;
 }
 
 // ======================================================
-// NUEVO: Cálculo de mejor BW/SF basado en menor tiempo
+// Cálculo de mejor BW/SF (menor tiempo)
 // ======================================================
 void calculateBestBwSf() {
   Serial.println("\n===========================================");
@@ -559,7 +501,6 @@ void calculateBestBwSf() {
     return;
   }
 
-  // Buscar la configuración con MENOR tiempo de transferencia
   uint32_t bestTime = bwsfResults[0].transferTime_ms;
   bestBwSfIndex = 0;
   
@@ -571,7 +512,6 @@ void calculateBestBwSf() {
     Serial.print(" dBm, SNR="); Serial.print(bwsfResults[i].snr);
     Serial.print(" | Calidad="); Serial.println(bwsfResults[i].quality);
     
-    // Priorizar MENOR tiempo
     if (bwsfResults[i].transferTime_ms < bestTime) {
       bestTime = bwsfResults[i].transferTime_ms;
       bestBwSfIndex = i;
@@ -589,14 +529,19 @@ void calculateBestBwSf() {
   Serial.println(" ms");
   Serial.println("===========================================\n");
 
-  bwsfFinalizationPending = true;
-  strcpy(pendingMsg, "SI");
-  pendingMsgLen = 2; pendingSend = true;
-  protocolPendingState = WAIT_SA_AFTER_SI; syncState = IDLE;
+  // Aplicar BW/SF óptimo localmente
+  LoRa.idle();
+  LoRa.setSignalBandwidth(bestBW_cache);
+  LoRa.setSpreadingFactor(bestSF_cache);
+  LoRa.receive();
+  currentBW = bestBW_cache;
+  currentSF = bestSF_cache;
+
+  currentPhase = PHASE_COMPLETE; syncState = IDLE;
 }
 
 // ======================================================
-// Funciones QS/SS/RS y Mensajería M
+// QS / SS / RS / M
 // ======================================================
 bool requestSlaveStatus(uint32_t timeout_ms) {
   lastStatusReceived = false;
@@ -618,14 +563,14 @@ bool healToSlaveState(uint32_t timeout_ms) {
   if (slaveTX_cache != 0 && slaveTX_cache != currentTX) {
     Serial.print("Curación: MAESTRO -> TX="); Serial.println(slaveTX_cache);
     LoRa.idle(); LoRa.setTxPower(slaveTX_cache, PA_OUTPUT_PA_BOOST_PIN); LoRa.receive();
-    currentTX = slaveTX_cache; changed = true; delay(60);
+    currentTX = slaveTX_cache; changed = true; delay(5);
   }
   if ((slaveBW_cache != 0 && slaveBW_cache != currentBW) ||
       (slaveSF_cache != 0 && slaveSF_cache != currentSF)) {
     Serial.print("Curación: MAESTRO -> BW="); Serial.print(slaveBW_cache);
     Serial.print(" SF="); Serial.println(slaveSF_cache);
     LoRa.idle(); LoRa.setSignalBandwidth(slaveBW_cache); LoRa.setSpreadingFactor(slaveSF_cache); LoRa.receive();
-    currentBW = slaveBW_cache; currentSF = slaveSF_cache; changed = true; delay(60);
+    currentBW = slaveBW_cache; currentSF = slaveSF_cache; changed = true; delay(5);
   }
   if (changed) {
     while (!LoRa.beginPacket()) { delay(5); }
@@ -649,7 +594,6 @@ bool verifyAndHealSync(uint32_t timeout_ms) {
     LoRa.write((uint8_t)0);  LoRa.write((uint8_t)0);
     LoRa.write((uint8_t)2);  LoRa.print("RS");
     LoRa.endPacket(true);
-    delay(200);
     if (!requestSlaveStatus(timeout_ms)) {
       Serial.println("Sin estado tras RS; abortando envío de M.");
       return false;
