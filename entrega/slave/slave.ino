@@ -15,7 +15,7 @@ const uint8_t localAddress  = 0x05;
 const uint8_t masterAddress = 0x06;
 const uint8_t SYNC_WORD     = 0x12;
 
-#define TIMEOUT_MS 12000
+#define TIMEOUT_MS 2500
 
 // Config original segura
 #define ORIGINAL_BW 125000L
@@ -80,7 +80,7 @@ void applyRadioTX(uint8_t tx) {
 
 void restorePrevConfig() {
   Serial.println(" Restaurando BW/SF anterior");
-  applyRadioBW_SF(prev_spreadingFactor, prev_bandwidth);
+  applyRadioBW_SF(ORIGINAL_SF, ORIGINAL_BW);
 }
 
 void restorePrevTX() {
