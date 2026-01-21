@@ -103,6 +103,7 @@ uint32_t cycleStartTime_ms = 0;
 // ---------- Soporte QS/SS/RS y Mensajería M ----------
 static volatile bool lastStatusReceived = false;
 static volatile bool lastMAReceived     = false;
+static volatile bool lastSAReceived     = false;
 static long         slaveBW_cache       = 0;
 static uint8_t      slaveSF_cache       = 0;
 static uint8_t      slaveTX_cache       = 0;
@@ -228,6 +229,17 @@ void loop() {
         }
       }
     } else if (currentPhase == PHASE_BWSF_SYNC) {
+      Serial.println("Timeout en BW/SF, restaurando ORIGINAL...");
+      
+      // Restaurar valores originales
+      LoRa.idle();
+      LoRa.setSignalBandwidth(ORIGINAL_BW);
+      LoRa.setSpreadingFactor(ORIGINAL_SF);
+      LoRa.setTxPower(currentTX, PA_OUTPUT_PA_BOOST_PIN);
+      LoRa.receive();
+      currentBW = ORIGINAL_BW;
+      currentSF = ORIGINAL_SF;
+
       Serial.println("Timeout en BW/SF, avanzar...\n");
       // Igual: avanzar al siguiente BW/SF sin reintentar infinito
       syncIndex++;
@@ -337,6 +349,7 @@ void onReceive(int packetSize) {
   if (!(receivedBytes >= 2 && buffer[0] == 'S' && buffer[1] == 'A')) {
     return;
   }
+  lastSAReceived = true;
   Serial.print(" SA recibido en estado ");
   Serial.println((int)syncState);
 
@@ -647,12 +660,94 @@ bool sendMReliable(const char* text, uint8_t maxRetries, uint32_t ackTimeout_ms)
   return false;
 }
 
+bool sendCmdWaitSA(const char* cmd, uint32_t timeout) {
+  lastSAReceived = false;
+  while(!LoRa.beginPacket()) delay(5);
+  LoRa.write(destination); LoRa.write(localAddress);
+  LoRa.write(0); LoRa.write(0); 
+  LoRa.write((uint8_t)strlen(cmd)); LoRa.print(cmd);
+  LoRa.endPacket(true);
+
+  uint32_t t0 = millis();
+  while(!lastSAReceived && (millis() - t0 < timeout)) {
+    LoRa.receive(); delay(5);
+  }
+  return lastSAReceived;
+}
+
 void enviarM_con_verificacion(const char* texto) {
   if (!verifyAndHealSync(2000)) {
-    Serial.println("Sincronización no válida; no se envía M.");
+    Serial.println("Sincronización no válida; no se envía M. Restaurando ORIGINAL.");
+    LoRa.idle();
+    LoRa.setSignalBandwidth(ORIGINAL_BW);
+    LoRa.setSpreadingFactor(ORIGINAL_SF);
+    LoRa.setTxPower(currentTX, PA_OUTPUT_PA_BOOST_PIN);
+    LoRa.receive();
+    currentBW = ORIGINAL_BW;
+    currentSF = ORIGINAL_SF;
     return;
   }
-  sendMReliable(texto, 3, 1500);
+  if (!sendMReliable(texto, 3, 1500)) {
+    Serial.println("Fallo confirmación M. Restaurando ORIGINAL.");
+    LoRa.idle();
+    LoRa.setSignalBandwidth(ORIGINAL_BW);
+    LoRa.setSpreadingFactor(ORIGINAL_SF);
+    LoRa.setTxPower(currentTX, PA_OUTPUT_PA_BOOST_PIN);
+    LoRa.receive();
+    currentBW = ORIGINAL_BW;
+    currentSF = ORIGINAL_SF;
+
+    Serial.println("Reintentando envio de M con configuracion ORIGINAL...");
+    if (sendMReliable(texto, 3, 1500)) {
+       Serial.println("Exito en ORIGINAL. Restaurando BEST config...");
+      
+      // --- 1. Restaurar TX (ST -> T... -> SE) ---
+      Serial.print("-> ST (TX)... ");
+      if (sendCmdWaitSA("ST", 2000)) Serial.println("OK"); else Serial.println("NO ACK");
+      delay(20);
+
+      char txcfg[16]; snprintf(txcfg, sizeof(txcfg), "T%u", bestTXCache);
+      Serial.print("-> "); Serial.print(txcfg); Serial.print("... ");
+      if (sendCmdWaitSA(txcfg, 2000)) Serial.println("OK"); else Serial.println("NO ACK");
+      delay(20);
+
+      Serial.print("-> SE (TX)... ");
+      if (sendCmdWaitSA("SE", 2000)) Serial.println("OK"); else Serial.println("NO ACK");
+      delay(100);
+
+      // --- 2. Restaurar BW/SF (SI -> X... -> SE) ---
+      Serial.print("-> SI (BW/SF)... ");
+      if (sendCmdWaitSA("SI", 2000)) Serial.println("OK");
+      else Serial.println("NO ACK");
+      delay(20);
+
+      // Enviar params BW/SF (X...Y...)
+      char cfg[32]; snprintf(cfg, 32, "X%ldY%u", bestBW_cache, bestSF_cache);
+      Serial.print("-> "); Serial.print(cfg); Serial.print("... ");
+      if (sendCmdWaitSA(cfg, 2000)) Serial.println("OK");
+      else Serial.println("NO ACK");
+      
+      // El esclavo envia ACK y luego cambia. Nosotros recibimos ACK y luego cambiamos.
+      delay(100); 
+
+      // Aplicar configuración localmente (TODO: TX, BW, SF)
+      LoRa.idle();
+      LoRa.setTxPower(bestTXCache, PA_OUTPUT_PA_BOOST_PIN);
+      LoRa.setSignalBandwidth(bestBW_cache);
+      LoRa.setSpreadingFactor(bestSF_cache);
+      LoRa.receive();
+      currentBW = bestBW_cache; currentSF = bestSF_cache; currentTX = bestTXCache;
+      Serial.println("Local config aplicada (TX+BW+SF).");
+      delay(50);
+
+      // Enviar SE para confirmar fin (en nueva config)
+      Serial.print("-> SE (Final)... ");
+      if (sendCmdWaitSA("SE", 2000)) Serial.println("OK");
+      else Serial.println("NO ACK");
+      
+      Serial.println("Restauracion completada.");
+    }
+  }
 }
 
 void maestroMessagingTick() {
